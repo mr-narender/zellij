@@ -118,6 +118,7 @@ pub struct Connection {
     pub session_name: String,
     pub geometry: GeometryHandle,
     pub role: Role,
+    pub remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +214,7 @@ pub fn open_at(
         session_name: session_name.to_owned(),
         geometry: GeometryHandle::new(geometry),
         role: opening.role(),
+        remote: false,
     })
 }
 
@@ -344,18 +346,7 @@ pub fn request_detach(sender: &SharedSender, role: Role) -> Result<()> {
             client_id: None,
             is_cli_client: false,
         },
-        Role::Watcher => {
-            let key = KeyWithModifier::new(BareKey::Esc);
-            let raw_bytes = key
-                .serialize_non_kitty()
-                .map(String::into_bytes)
-                .unwrap_or_default();
-            ClientToServerMsg::Key {
-                key,
-                raw_bytes,
-                is_kitty_keyboard_protocol: false,
-            }
-        },
+        Role::Watcher => crate::input::key_press_message(KeyWithModifier::new(BareKey::Esc)),
     };
     send(sender, msg)
 }

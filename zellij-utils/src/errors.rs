@@ -263,6 +263,7 @@ pub enum ScreenContext {
     MovePaneRight,
     MovePaneLeft,
     Exit,
+    SessionEnding,
     ClearScreen,
     DumpScreen,
     DumpLayout,
@@ -583,6 +584,7 @@ pub enum PtyContext {
     UpdateAndReportCwds,
     NotifyCwdFromOsc7,
     RunInBackground,
+    SetResurrectCommand,
     PromptReturned,
     Exit,
 }

@@ -239,6 +239,7 @@ pub(crate) struct App {
     clipboard: ClipboardHandle,
     title: String,
     session_name: String,
+    remote_session: bool,
     notice: Option<Notice>,
     retained: RetainedScene,
     blink: BlinkPhase,
@@ -836,7 +837,9 @@ impl App {
         if state.is_pressed() {
             self.set_selection(None);
         }
-        self.note_link_click(button, state);
+        if self.note_link_click(button, state) {
+            return;
+        }
         if self.middle_click_pasted(button, state) {
             return;
         }
@@ -967,9 +970,9 @@ impl App {
         }
     }
 
-    fn note_link_click(&mut self, button: winit::event::MouseButton, state: ElementState) {
+    fn note_link_click(&mut self, button: winit::event::MouseButton, state: ElementState) -> bool {
         if button != winit::event::MouseButton::Left {
-            return;
+            return false;
         }
         let cell = self.pointer.cell_if_inside(self.geometry.get());
         if state.is_pressed() {
@@ -983,14 +986,19 @@ impl App {
                 cell,
                 self.hovered_link.as_ref(),
             );
-            return;
+            return self
+                .armed_link
+                .as_ref()
+                .is_some_and(|armed| armed.deliberate);
         }
-        let Some(uri) = links::released_on(self.armed_link.take(), cell) else {
-            return;
-        };
-        if let Err(e) = links::open(&uri) {
-            report!("{}", e);
+        let armed = self.armed_link.take();
+        let deliberate = armed.as_ref().is_some_and(|armed| armed.deliberate);
+        if let Some(uri) = links::released_on(armed, cell) {
+            if let Err(e) = links::open(&uri) {
+                report!("{}", e);
+            }
         }
+        deliberate
     }
 
     fn link_opening(&self) -> links::Opening {
@@ -1599,6 +1607,7 @@ impl App {
         match session.reconnect(&target, geometry) {
             Ok(connection) => {
                 let session_name = connection.session_name.clone();
+                self.remote_session = connection.remote;
                 self.sender = Some(connection.sender.clone());
                 self.role = connection.role;
                 self.geometry = connection.geometry.clone();
@@ -1639,6 +1648,11 @@ impl App {
         self.standalone = standalone;
     }
 
+    pub(crate) fn set_remote_session(&mut self, remote: bool) {
+        self.remote_session = remote;
+        self.state.set_shared_media(!remote);
+    }
+
     pub(crate) fn adopt_history(&self, history: zellij_utils::session_history::SessionHistory) {
         if let Err(e) = self.tell(ClientToServerMsg::AdoptSessionHistory { history }) {
             report!(
@@ -1653,6 +1667,7 @@ impl App {
         self.state = TerminalState::new(geometry.rows, geometry.cols);
         self.state
             .set_cell_size(self.metrics.width, self.metrics.height);
+        self.state.set_shared_media(!self.remote_session);
         self.composition.cancel();
         self.composed_row = None;
         self.selecting = false;
@@ -2201,6 +2216,7 @@ pub(crate) fn terminal_app(made: TerminalWindow, key: u64, proxy: EventLoopProxy
     let sender = connection.sender.clone();
     let title = window_title(&connection.session_name);
     let session_name = connection.session_name.clone();
+    let remote = connection.remote;
     let state_path = (remember && loop_options.record_path.is_none()).then(window_state::path);
     loop_options.clipboard = Some(clipboard.clone());
 
@@ -2227,6 +2243,7 @@ pub(crate) fn terminal_app(made: TerminalWindow, key: u64, proxy: EventLoopProxy
     app.key = key;
     app.state_path = state_path;
     app.session_name = session_name;
+    app.set_remote_session(remote);
     app
 }
 
@@ -2444,6 +2461,7 @@ impl Rendering {
             clipboard,
             title,
             session_name: String::new(),
+            remote_session: false,
             notice: None,
             retained: RetainedScene::new(),
             blink: BlinkPhase::On,
@@ -2828,6 +2846,7 @@ mod tests {
             scroll_momentum_friction: 2.0,
             option_as_alt: OptionAsAlt::Left,
             reuse_session_windows: true,
+            allow_remote_clipboard_read: false,
         }
     }
 
@@ -3645,7 +3664,7 @@ mod tests {
                     'a'
                 )),
                 raw_bytes: b"a".to_vec(),
-                is_kitty_keyboard_protocol: false,
+                is_kitty_keyboard_protocol: true,
             }]
         );
     }
@@ -3684,7 +3703,7 @@ mod tests {
         harness.app.modifiers = ModifiersState::CONTROL | ModifiersState::SHIFT;
         harness.press(&character("V"));
         match &harness.sent()[0] {
-            ClientToServerMsg::Key { raw_bytes, .. } => assert_eq!(raw_bytes, &vec![0x16]),
+            ClientToServerMsg::Key { raw_bytes, .. } => assert_eq!(raw_bytes, b"\x1b[118;6u"),
             other => panic!("expected a key, got {:?}", other),
         }
     }
@@ -5619,7 +5638,7 @@ mod tests {
                 vec![ClientToServerMsg::Key {
                     key: KeyWithModifier::new(BareKey::Char('t')),
                     raw_bytes: b"t".to_vec(),
-                    is_kitty_keyboard_protocol: false,
+                    is_kitty_keyboard_protocol: true,
                 }],
                 "an input method that commits ordinary letters must not bypass the session's modes"
             );
@@ -5715,7 +5734,7 @@ mod tests {
             ClientToServerMsg::Key {
                 key: KeyWithModifier::new(BareKey::Char(character)),
                 raw_bytes: character.to_string().into_bytes(),
-                is_kitty_keyboard_protocol: false,
+                is_kitty_keyboard_protocol: true,
             }
         }
 
@@ -5790,7 +5809,9 @@ mod tests {
             harness.app.modifiers = ModifiersState::CONTROL;
             press_with_text(&mut harness, character("c"), "^c");
             match &harness.sent()[0] {
-                ClientToServerMsg::Key { raw_bytes, .. } => assert_eq!(raw_bytes, &vec![3]),
+                ClientToServerMsg::Key { raw_bytes, .. } => {
+                    assert_eq!(raw_bytes, b"\x1b[99;5u")
+                },
                 other => panic!("expected ctrl-c, got {:?}", other),
             }
         }

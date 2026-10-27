@@ -179,6 +179,17 @@ impl FloatingPanes {
         self.panes.keys()
     }
     pub fn rendered_pane_ids(&self) -> Vec<PaneId> {
+        if let Some(fullscreen_pane_id) = self.fullscreen_pane_id {
+            return self
+                .panes
+                .contains_key(&fullscreen_pane_id)
+                .then_some(fullscreen_pane_id)
+                .into_iter()
+                .collect();
+        }
+        if *self.fullscreen_covers_ui.borrow() {
+            return vec![];
+        }
         if self.panes_are_visible() {
             self.panes.keys().copied().collect()
         } else {
@@ -1890,7 +1901,7 @@ impl FloatingPanes {
         match self
             .panes
             .iter_mut()
-            .find(|(_, p)| p.invoked_with() == &run)
+            .find(|(_, p)| Run::fills_same_layout_slot(p.invoked_with(), &run))
         {
             Some((_, pane)) => {
                 pane.set_geom(geom);
