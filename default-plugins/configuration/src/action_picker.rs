@@ -363,6 +363,29 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         "Set the pane frame style",
         &[positional("Style", ArgKind::Choice(FRAME_STYLES), true)],
     ),
+    with_args(
+        "ToggleBars",
+        "Show all bars if any are hidden, otherwise hide the named bars (all if none are named)",
+        &[ArgSpec {
+            name: "",
+            label: "Bars (eg. tab-bar status-bar)",
+            kind: ArgKind::Text,
+            place: ArgPlace::Rest,
+            required: false,
+        }],
+    ),
+    with_args(
+        "HideBars",
+        "Hide the named bars (all if none are named)",
+        &[ArgSpec {
+            name: "",
+            label: "Bars (eg. tab-bar status-bar)",
+            kind: ArgKind::Text,
+            place: ArgPlace::Rest,
+            required: false,
+        }],
+    ),
+    plain("ShowBars", "Show all hidden bars"),
     plain("ToggleMouseMode", "Turn mouse support on or off"),
     plain("SetDarkTheme", "Use the dark theme"),
     plain("SetLightTheme", "Use the light theme"),
@@ -407,7 +430,7 @@ pub const ACTION_SPECS: &[ActionSpec] = &[
         "Show or hide the desktop app's tray icon until it restarts",
     ),
     plain(
-        "OpenSessionInWindow",
+        "OpenSessionInTerminal",
         "Open this session in a desktop window (it opens on the computer running Zellij)",
     ),
     plain("MarkPaneSeen", "Clear past events of the focused pane"),

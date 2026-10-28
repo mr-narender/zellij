@@ -307,7 +307,7 @@ pub struct OverrideLayoutPayload {
 pub struct Action {
     #[prost(enumeration="ActionName", tag="1")]
     pub name: i32,
-    #[prost(oneof="action::OptionalPayload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70")]
+    #[prost(oneof="action::OptionalPayload", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71")]
     pub optional_payload: ::core::option::Option<action::OptionalPayload>,
 }
 /// Nested message and enum types in `Action`.
@@ -447,7 +447,15 @@ pub mod action {
         SessionPanePayload(super::SessionPanePayload),
         #[prost(bytes, tag="70")]
         SessionNameInputPayload(::prost::alloc::vec::Vec<u8>),
+        #[prost(message, tag="71")]
+        BarNamesPayload(super::BarNamesPayload),
     }
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BarNamesPayload {
+    #[prost(string, repeated, tag="1")]
+    pub bar_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1257,10 +1265,14 @@ pub enum ActionName {
     MarkPaneSeen = 143,
     MarkAllSeen = 144,
     ToggleTrayIcon = 145,
-    OpenSessionInWindow = 146,
+    OpenSessionInTerminal = 146,
     SessionNameInput = 147,
     UndoRenameSession = 148,
     ToggleMirrorResize = 149,
+    ToggleBars = 150,
+    HideBars = 151,
+    ShowBars = 152,
+    HideBarByPaneId = 153,
 }
 impl ActionName {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1412,10 +1424,14 @@ impl ActionName {
             ActionName::MarkPaneSeen => "MarkPaneSeen",
             ActionName::MarkAllSeen => "MarkAllSeen",
             ActionName::ToggleTrayIcon => "ToggleTrayIcon",
-            ActionName::OpenSessionInWindow => "OpenSessionInWindow",
+            ActionName::OpenSessionInTerminal => "OpenSessionInTerminal",
             ActionName::SessionNameInput => "SessionNameInput",
             ActionName::UndoRenameSession => "UndoRenameSession",
             ActionName::ToggleMirrorResize => "ToggleMirrorResize",
+            ActionName::ToggleBars => "ToggleBars",
+            ActionName::HideBars => "HideBars",
+            ActionName::ShowBars => "ShowBars",
+            ActionName::HideBarByPaneId => "HideBarByPaneId",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1564,10 +1580,14 @@ impl ActionName {
             "MarkPaneSeen" => Some(Self::MarkPaneSeen),
             "MarkAllSeen" => Some(Self::MarkAllSeen),
             "ToggleTrayIcon" => Some(Self::ToggleTrayIcon),
-            "OpenSessionInWindow" => Some(Self::OpenSessionInWindow),
+            "OpenSessionInTerminal" => Some(Self::OpenSessionInTerminal),
             "SessionNameInput" => Some(Self::SessionNameInput),
             "UndoRenameSession" => Some(Self::UndoRenameSession),
             "ToggleMirrorResize" => Some(Self::ToggleMirrorResize),
+            "ToggleBars" => Some(Self::ToggleBars),
+            "HideBars" => Some(Self::HideBars),
+            "ShowBars" => Some(Self::ShowBars),
+            "HideBarByPaneId" => Some(Self::HideBarByPaneId),
             _ => None,
         }
     }

@@ -849,6 +849,41 @@ fn route_action_with_origin(
                 ))
                 .with_context(err_context)?;
         },
+        Action::ToggleBars { bars } => {
+            senders
+                .send_to_screen(ScreenInstruction::ToggleBars(
+                    bars,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::HideBars { bars } => {
+            senders
+                .send_to_screen(ScreenInstruction::HideBars(
+                    bars,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::ShowBars => {
+            senders
+                .send_to_screen(ScreenInstruction::ShowBars(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::HideBarByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::HideBarByPaneId(
+                    pane_id.into(),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::NewPane {
             direction,
             pane_name,
@@ -1596,11 +1631,11 @@ fn route_action_with_origin(
                 ))
                 .with_context(err_context)?;
         },
-        Action::OpenSessionInWindow => {
+        Action::OpenSessionInTerminal => {
             drop(NotificationEnd::new(completion_tx));
             let session_name = zellij_utils::envs::get_session_name().ok();
             let _ = std::thread::Builder::new()
-                .name("open_session_in_window".to_owned())
+                .name("open_session_in_terminal".to_owned())
                 .spawn(move || {
                     let request = zellij_utils::app_control::OpenWindowRequest {
                         session: session_name,

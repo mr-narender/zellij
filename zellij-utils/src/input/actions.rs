@@ -796,7 +796,7 @@ pub enum Action {
     GoToNextSession,
     GoToNextAttention,
     ToggleTrayIcon,
-    OpenSessionInWindow,
+    OpenSessionInTerminal,
     WaitForPaneExit {
         pane_id: PaneId,
     },
@@ -810,6 +810,16 @@ pub enum Action {
     },
     WriteKeyToPaneId {
         key_with_modifier: Option<KeyWithModifier>,
+        pane_id: PaneId,
+    },
+    ToggleBars {
+        bars: Vec<String>,
+    },
+    HideBars {
+        bars: Vec<String>,
+    },
+    ShowBars,
+    HideBarByPaneId {
         pane_id: PaneId,
     },
 }
@@ -1282,6 +1292,9 @@ impl Action {
             },
             CliAction::TogglePaneFrames => Ok(vec![Action::TogglePaneFrames]),
             CliAction::SetPaneFrameStyle { style } => Ok(vec![Action::SetPaneFrameStyle(style)]),
+            CliAction::ToggleBars { bars } => Ok(vec![Action::ToggleBars { bars }]),
+            CliAction::HideBars { bars } => Ok(vec![Action::HideBars { bars }]),
+            CliAction::ShowBars => Ok(vec![Action::ShowBars]),
             CliAction::ToggleActiveSyncTab { tab_id } => match tab_id {
                 Some(id) => Ok(vec![Action::ToggleActiveSyncTabByTabId { id: id as u64 }]),
                 None => Ok(vec![Action::ToggleActiveSyncTab]),

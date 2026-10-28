@@ -572,6 +572,12 @@ fn test_client_messages() {
                 session_indicator: Some(true),
                 swap_layout_notification: Some(false),
                 on_quit: Some(crate::input::options::OnQuit::AskDetach),
+                bars_hidden_on_start: Some(crate::data::HiddenBars::from_names(&[
+                    "tab-bar",
+                    "status-bar",
+                ])),
+                hidden_bars_notification: Some(false),
+                mode_hints_when_bars_hidden: Some(true),
             }),
             layout: None,
             terminal_window_size: Size { rows: 80, cols: 42 },
@@ -1196,6 +1202,34 @@ fn test_client_messages() {
     });
     test_client_roundtrip!(ClientToServerMsg::Action {
         action: Action::TogglePaneFrames,
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::ToggleBars {
+            bars: vec!["status-bar".to_owned()],
+        },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::HideBars { bars: vec![] },
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::ShowBars,
+        terminal_id: Some(1),
+        client_id: Some(100),
+        is_cli_client: true,
+    });
+    test_client_roundtrip!(ClientToServerMsg::Action {
+        action: Action::HideBarByPaneId {
+            pane_id: PaneId::Plugin(4),
+        },
         terminal_id: Some(1),
         client_id: Some(100),
         is_cli_client: true,
@@ -4266,19 +4300,19 @@ fn test_server_messages() {
     test_server_roundtrip!(ServerToClientMsg::QueryTerminalSize);
     test_server_roundtrip!(ServerToClientMsg::StartWebServer);
     test_server_roundtrip!(ServerToClientMsg::ConfigFileUpdated);
-    test_server_roundtrip!(ServerToClientMsg::WindowSettingsChanged {
-        settings: Box::new(crate::input::window::WindowSettings::default()),
+    test_server_roundtrip!(ServerToClientMsg::TerminalSettingsChanged {
+        settings: Box::new(crate::input::terminal::TerminalSettings::default()),
     });
     let mut window_config = crate::input::config::Config::from_kdl(
-        "theme \"dracula\"\nwindow {\n    font \"Iosevka\"\n    opacity 0.9\n    paste_keys \"Ctrl Shift v\" \"Shift Insert\"\n    theme {\n        red 1 2 3\n    }\n}\n",
+        "theme \"dracula\"\nterminal {\n    font \"Iosevka\"\n    opacity 0.9\n    paste_keys \"Ctrl Shift v\" \"Shift Insert\"\n    theme {\n        red 1 2 3\n    }\n}\n",
         Some(crate::input::config::Config::from_default_assets().unwrap()),
     )
     .unwrap();
     window_config.themes = window_config
         .themes
         .merge(crate::setup::get_default_themes());
-    test_server_roundtrip!(ServerToClientMsg::WindowSettingsChanged {
-        settings: Box::new(crate::input::window::WindowSettings::from_config(
+    test_server_roundtrip!(ServerToClientMsg::TerminalSettingsChanged {
+        settings: Box::new(crate::input::terminal::TerminalSettings::from_config(
             &window_config
         )),
     });

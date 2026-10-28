@@ -130,18 +130,21 @@ use zellij_utils::plugin_api::plugin_command::{
 
 macro_rules! apply_action {
     ($action:ident, $error_message:ident, $env: ident) => {
-        match route_action(
-            $action,
-            acting_client(&$env),
-            None,
-            source_pane(&$env),
-            $env.senders.clone(),
-            $env.default_shell.clone(),
-            None,
-            $env.default_mode.clone(),
-            None,
-            false,
-        ) {
+        match {
+            let _blocking_call_guard = BlockingCallGuard::new(&$env);
+            route_action(
+                $action,
+                acting_client(&$env),
+                None,
+                source_pane(&$env),
+                $env.senders.clone(),
+                $env.default_shell.clone(),
+                None,
+                $env.default_mode.clone(),
+                None,
+                false,
+            )
+        } {
             Ok((_, result)) => result,
             Err(e) => {
                 log::error!("{}: {:?}", $error_message(), e);
@@ -149,6 +152,31 @@ macro_rules! apply_action {
             },
         }
     };
+}
+
+struct BlockingCallGuard {
+    in_blocking_call: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl BlockingCallGuard {
+    fn new(env: &PluginEnv) -> Self {
+        let in_blocking_call = env
+            .shared
+            .as_ref()
+            .map(|shared| shared.in_blocking_call.clone());
+        if let Some(in_blocking_call) = &in_blocking_call {
+            in_blocking_call.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        BlockingCallGuard { in_blocking_call }
+    }
+}
+
+impl Drop for BlockingCallGuard {
+    fn drop(&mut self) {
+        if let Some(in_blocking_call) = &self.in_blocking_call {
+            in_blocking_call.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 fn translate_plugin_path(env: &PluginEnv, path: PathBuf) -> PathBuf {
@@ -530,7 +558,7 @@ fn session_pane_command(
         });
 }
 
-fn open_session_window(env: &PluginEnv, request: zellij_utils::data::SessionWindowRequest) {
+fn open_session_terminal(env: &PluginEnv, request: zellij_utils::data::SessionTerminalRequest) {
     let creates_a_session = request.creates_a_session();
     let mut layout_holder = ConnectToSession {
         layout: request.layout.clone(),
@@ -545,7 +573,7 @@ fn open_session_window(env: &PluginEnv, request: zellij_utils::data::SessionWind
         .map(|c| translate_plugin_path(env, c))
         .or_else(|| creates_a_session.then(|| env.plugin_cwd.clone()));
     let _ = std::thread::Builder::new()
-        .name("open_session_window".to_owned())
+        .name("open_session_terminal".to_owned())
         .spawn(move || {
             let request = zellij_utils::app_control::OpenWindowRequest {
                 create: request.new_window || request.session_name.is_none(),
@@ -619,10 +647,12 @@ fn desktop_integration(env: &PluginEnv, request: String) {
 }
 
 fn set_popup_size(env: &mut PluginEnv, width: usize, height: usize) {
-    env.pending_popup_size = Some((width, height));
+    if env.shared.is_none() {
+        env.pending_popup_size = Some((width, height));
+    }
     env.senders
         .send_to_screen(ScreenInstruction::SetPopupSize {
-            plugin_id: env.plugin_id,
+            plugin_id: self_pane_id(env),
             width,
             height,
         })
@@ -721,8 +751,8 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::MarkAllSeen { session_name } => {
                         mark_all_seen(env, session_name)
                     },
-                    PluginCommand::OpenSessionWindow(request) => {
-                        open_session_window(env, request)
+                    PluginCommand::OpenSessionTerminal(request) => {
+                        open_session_terminal(env, request)
                     },
                     PluginCommand::WriteToSessionPane {
                         session_name,
@@ -1004,6 +1034,13 @@ fn host_run_plugin_command(mut caller: Caller<'_, PluginEnv>) {
                     PluginCommand::SetPaneFrameStyle(pane_frame_style) => {
                         set_pane_frame_style(env, pane_frame_style)
                     },
+                    PluginCommand::ToggleBars(bars) => {
+                        apply_bars_action(env, Action::ToggleBars { bars })
+                    },
+                    PluginCommand::HideBars(bars) => {
+                        apply_bars_action(env, Action::HideBars { bars })
+                    },
+                    PluginCommand::ShowBars => apply_bars_action(env, Action::ShowBars),
                     PluginCommand::TogglePaneEmbedOrEject => toggle_pane_embed_or_eject(env),
                     PluginCommand::UndoRenamePane => undo_rename_pane(env),
                     PluginCommand::CloseFocus => close_focus(env),
@@ -4302,6 +4339,11 @@ fn set_pane_frame_style(env: &PluginEnv, pane_frame_style: PaneFrameStyle) {
     apply_action!(action, error_msg, env);
 }
 
+fn apply_bars_action(env: &PluginEnv, action: Action) {
+    let error_msg = || format!("failed to change hidden bars in plugin {}", env.name());
+    apply_action!(action, error_msg, env);
+}
+
 fn toggle_pane_embed_or_eject(env: &PluginEnv) {
     let error_msg = || {
         format!(
@@ -6713,7 +6755,7 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
         },
         PluginCommand::MarkSessionPaneSeen { .. }
         | PluginCommand::MarkAllSeen { .. }
-        | PluginCommand::OpenSessionWindow(..)
+        | PluginCommand::OpenSessionTerminal(..)
         | PluginCommand::DesktopIntegration(..)
         | PluginCommand::ToggleSessionPaneMute { .. }
         | PluginCommand::ToggleSessionPaneIgnoreOutput { .. }
@@ -6761,6 +6803,9 @@ fn required_permission(command: &PluginCommand) -> Option<PermissionType> {
         | PluginCommand::TogglePaneIdFullscreen(..)
         | PluginCommand::TogglePaneFrames
         | PluginCommand::SetPaneFrameStyle(..)
+        | PluginCommand::ToggleBars(..)
+        | PluginCommand::HideBars(..)
+        | PluginCommand::ShowBars
         | PluginCommand::ToggleFloatingPanes { .. }
         | PluginCommand::NewPane
         | PluginCommand::TogglePaneEmbedOrEject
