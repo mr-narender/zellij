@@ -1,6 +1,5 @@
-use unicode_width::UnicodeWidthChar;
-use unicode_width::UnicodeWidthStr;
 use zellij_utils::data::Style;
+use zellij_utils::graphemes::{self, display_width};
 
 use crate::output::CharacterChunk;
 use crate::panes::terminal_character::{
@@ -17,7 +16,7 @@ pub struct GuestModalShortcuts {
 type GuestModalSegment = (String, RcCharacterStyles);
 
 fn guest_modal_row_width(segments: &[GuestModalSegment]) -> usize {
-    segments.iter().map(|(text, _)| text.width()).sum()
+    segments.iter().map(|(text, _)| display_width(text)).sum()
 }
 
 fn guest_modal_empty_row(
@@ -60,13 +59,33 @@ fn guest_modal_segment_row(
         used += 1;
     }
     for (text, styles) in segments {
-        for character in text.chars() {
-            let width = character.width().unwrap_or(0).max(1);
+        if text.is_ascii() {
+            for character in text.chars() {
+                if character.is_ascii_control() {
+                    continue;
+                }
+                if used + 1 > columns {
+                    break;
+                }
+                characters.push(TerminalCharacter::new_singlewidth_styled(
+                    character,
+                    styles.clone(),
+                ));
+                used += 1;
+            }
+            continue;
+        }
+        for (cluster, width) in graphemes::clusters(text) {
+            if width == 0 {
+                continue;
+            }
             if used + width > columns {
                 break;
             }
-            characters.push(TerminalCharacter::new_styled(character, styles.clone()));
-            used += width;
+            if let Some(cell) = TerminalCharacter::from_cluster(cluster, width, styles.clone()) {
+                characters.push(cell);
+                used += width;
+            }
         }
     }
     while used < block_end {
@@ -171,7 +190,7 @@ fn guest_modal_wrap_words(
     let mut current: Vec<GuestModalSegment> = Vec::new();
     let mut current_width = 0;
     for (word, styles) in words {
-        let word_width = word.width();
+        let word_width = display_width(word);
         let extra = if current.is_empty() {
             word_width
         } else {
@@ -210,6 +229,7 @@ pub fn guest_modal_chunks(
     style: &Style,
     session_name: &str,
     selected: usize,
+    hovered: Option<usize>,
     shortcuts: &GuestModalShortcuts,
 ) -> Vec<CharacterChunk> {
     if rows < 1 || columns < 1 {
@@ -228,7 +248,15 @@ pub fn guest_modal_chunks(
         ));
     }
 
-    let layout = guest_modal_layout(columns, rows, &styles, session_name, selected, shortcuts);
+    let layout = guest_modal_layout(
+        columns,
+        rows,
+        &styles,
+        session_name,
+        selected,
+        hovered,
+        shortcuts,
+    );
     for (offset, row) in layout.rows.iter().enumerate() {
         let current_row = layout.start_row + offset;
         if current_row >= rows {
@@ -329,6 +357,7 @@ struct GuestModalLayout {
     rows: Vec<GuestModalRow>,
     block_width: usize,
     option_rows: Vec<usize>,
+    option_row_ranges: Vec<std::ops::Range<usize>>,
     left_pad: usize,
     start_row: usize,
 }
@@ -355,6 +384,7 @@ fn guest_modal_fallback_layout(
         }],
         block_width,
         option_rows: vec![],
+        option_row_ranges: vec![],
         left_pad,
         start_row: rows / 2,
     }
@@ -366,6 +396,7 @@ fn guest_modal_layout(
     styles: &GuestModalStyles,
     session_name: &str,
     selected: usize,
+    hovered: Option<usize>,
     shortcuts: &GuestModalShortcuts,
 ) -> GuestModalLayout {
     if columns < 20 {
@@ -407,12 +438,13 @@ fn guest_modal_layout(
         .max()
         .unwrap_or(0);
     for (number, option_title) in options.iter() {
-        block_width = block_width.max(2 + number.width() + option_title.width());
+        block_width = block_width.max(2 + display_width(number) + display_width(option_title));
     }
     let block_width = block_width.min(columns);
 
     let mut rows_content: Vec<GuestModalRow> = Vec::new();
     let mut option_rows: Vec<usize> = Vec::new();
+    let mut option_row_ranges: Vec<std::ops::Range<usize>> = Vec::new();
     rows_content.push(GuestModalRow {
         segments: title,
         block_fill: styles.fill.clone(),
@@ -449,8 +481,14 @@ fn guest_modal_layout(
                 styles.fill.clone(),
             )
         };
+        let title_styles = if hovered == Some(index) {
+            (*title_styles).italic(Some(AnsiCode::On)).into()
+        } else {
+            title_styles
+        };
         let marker = if is_selected { "> " } else { "  " };
-        option_rows.push(rows_content.len());
+        let option_start = rows_content.len();
+        option_rows.push(option_start);
         rows_content.push(GuestModalRow {
             segments: vec![
                 (format!("{}{}", marker, number), marker_styles),
@@ -470,6 +508,7 @@ fn guest_modal_layout(
                 block_fill: block_fill.clone(),
             });
         }
+        option_row_ranges.push(option_start..rows_content.len());
     }
     rows_content.push(GuestModalRow {
         segments: Vec::new(),
@@ -491,15 +530,18 @@ fn guest_modal_layout(
         rows: rows_content,
         block_width,
         option_rows,
+        option_row_ranges,
         left_pad,
         start_row,
     }
 }
 
-pub fn guest_modal_option_at_content_row(
+#[allow(clippy::too_many_arguments)]
+pub fn guest_modal_option_at_content_position(
     rows: usize,
     columns: usize,
     row: usize,
+    column: usize,
     style: &Style,
     session_name: &str,
     selected: usize,
@@ -509,14 +551,23 @@ pub fn guest_modal_option_at_content_row(
         return None;
     }
     let styles = guest_modal_styles(style);
-    let layout = guest_modal_layout(columns, rows, &styles, session_name, selected, shortcuts);
-    if layout.option_rows.is_empty() {
+    let layout = guest_modal_layout(
+        columns,
+        rows,
+        &styles,
+        session_name,
+        selected,
+        None,
+        shortcuts,
+    );
+    if column < layout.left_pad || column >= layout.left_pad + layout.block_width {
         return None;
     }
+    let row_in_block = row.checked_sub(layout.start_row)?;
     layout
-        .option_rows
+        .option_row_ranges
         .iter()
-        .position(|&option_row| layout.start_row + option_row == row)
+        .position(|range| range.contains(&row_in_block))
 }
 
 fn center_modal_pad(block_width: usize, columns: usize) -> usize {

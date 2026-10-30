@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
+use crate::deadline::{ProgressDeadline, CLIENT_SCREEN_PROGRESS};
 use zellij_server::panes::kitty_graphics::KittyImageStore;
 pub use zellij_server::panes::terminal_character::AnsiCode;
 use zellij_server::panes::{LinkHandler, TerminalPane};
@@ -29,7 +30,9 @@ pub enum HostTerminal {
     Basic,
     Kitty,
     KittyZlib,
+    ProgramStatus,
     Manual,
+    GraphemeClusterAware(u8),
 }
 
 const PRIMARY_DA_QUERY: &[u8] = b"\x1b[c";
@@ -40,6 +43,9 @@ const KITTY_ZLIB_PROBE_PREFIX: &[u8] = b"\x1b_Ga=q,i=32,";
 const KITTY_ZLIB_PROBE_REPLY: &[u8] = b"\x1b_Gi=32;OK\x1b\\";
 const CELL_SIZE_QUERY: &[u8] = b"\x1b[16t";
 const CELL_SIZE_REPLY: &[u8] = b"\x1b[6;21;8t";
+const GRAPHEME_CLUSTER_MODE_QUERY: &[u8] = b"\x1b[?2027$p";
+const PROGRAM_STATUS_QUERY: &[u8] = b"\x1b]7501;?\x1b\\";
+const PROGRAM_STATUS_REPLY: &[u8] = b"\x1b]7501;?\x1b\\";
 
 struct HostResponder {
     host_terminal: HostTerminal,
@@ -48,9 +54,11 @@ struct HostResponder {
 }
 
 impl HostResponder {
-    fn answers(&self) -> &'static [(&'static [u8], &'static [u8])] {
-        match self.host_terminal {
-            HostTerminal::Basic => &[(PRIMARY_DA_QUERY, PRIMARY_DA_REPLY)],
+    fn answers(&self) -> Vec<(&'static [u8], Vec<u8>)> {
+        let static_answers: &[(&'static [u8], &'static [u8])] = match self.host_terminal {
+            HostTerminal::Basic | HostTerminal::GraphemeClusterAware(_) => {
+                &[(PRIMARY_DA_QUERY, PRIMARY_DA_REPLY)]
+            },
             HostTerminal::Kitty => &[
                 (PRIMARY_DA_QUERY, PRIMARY_DA_REPLY),
                 (KITTY_GRAPHICS_PROBE_PREFIX, KITTY_GRAPHICS_PROBE_REPLY),
@@ -62,8 +70,23 @@ impl HostResponder {
                 (KITTY_ZLIB_PROBE_PREFIX, KITTY_ZLIB_PROBE_REPLY),
                 (CELL_SIZE_QUERY, CELL_SIZE_REPLY),
             ],
+            HostTerminal::ProgramStatus => &[
+                (PROGRAM_STATUS_QUERY, PROGRAM_STATUS_REPLY),
+                (PRIMARY_DA_QUERY, PRIMARY_DA_REPLY),
+            ],
             HostTerminal::Manual => &[],
+        };
+        let mut answers: Vec<(&'static [u8], Vec<u8>)> = static_answers
+            .iter()
+            .map(|(query, reply)| (*query, reply.to_vec()))
+            .collect();
+        if let HostTerminal::GraphemeClusterAware(value) = self.host_terminal {
+            answers.push((
+                GRAPHEME_CLUSTER_MODE_QUERY,
+                format!("\x1b[?2027;{}$y", value).into_bytes(),
+            ));
         }
+        answers
     }
 
     fn observe(&mut self, bytes: &[u8]) {
@@ -142,22 +165,26 @@ impl ClientScreen {
     }
 
     pub fn wait_until_raw_output(&self, what: &str, predicate: impl Fn(&[u8]) -> bool) -> Vec<u8> {
-        let deadline = Instant::now() + crate::default_timeout();
+        let mut deadline = ProgressDeadline::starting_now(CLIENT_SCREEN_PROGRESS);
         let mut received_bytes = self.inner.received_bytes.lock().unwrap();
         loop {
             if predicate(&received_bytes.bytes) {
                 return received_bytes.bytes.clone();
             }
             let now = Instant::now();
-            if now >= deadline {
+            if let Some(tier) = deadline.expired(now) {
                 let size = *self.size.lock().unwrap();
                 let grid_snapshot = render_bytes(&received_bytes.bytes, size);
+                let (byte_count, generation) =
+                    (received_bytes.bytes.len(), received_bytes.generation);
+                drop(received_bytes);
                 panic!(
-                    "timed out waiting for: {}\nlast rendered grid:\n{}\n=== (received {} stdout bytes, generation {}) ===\n=== zellij log tail ({}) ===\n{}",
+                    "timed out waiting for: {}\n{}\nlast rendered grid:\n{}\n=== (received {} stdout bytes, generation {}) ===\n=== zellij log tail ({}) ===\n{}",
                     what,
+                    deadline.explain(tier, now),
                     grid_snapshot.text,
-                    received_bytes.bytes.len(),
-                    received_bytes.generation,
+                    byte_count,
+                    generation,
                     crate::test_env::log_file_path().display(),
                     crate::test_env::log_tail(40),
                 );
@@ -166,11 +193,11 @@ impl ClientScreen {
             let (guard, _) = self
                 .inner
                 .change_signal
-                .wait_timeout(received_bytes, deadline - now)
+                .wait_timeout(received_bytes, deadline.remaining(now))
                 .unwrap();
             received_bytes = guard;
-            if received_bytes.generation == last_generation {
-                continue;
+            if received_bytes.generation != last_generation {
+                deadline.note_progress(Instant::now());
             }
         }
     }
@@ -180,7 +207,7 @@ impl ClientScreen {
         what: &str,
         predicate: impl Fn(&GridSnapshot) -> bool,
     ) -> GridSnapshot {
-        let deadline = Instant::now() + crate::default_timeout();
+        let mut deadline = ProgressDeadline::starting_now(CLIENT_SCREEN_PROGRESS);
         let mut received_bytes = self.inner.received_bytes.lock().unwrap();
         loop {
             let size = *self.size.lock().unwrap();
@@ -189,19 +216,23 @@ impl ClientScreen {
                 return grid_snapshot;
             }
             let now = Instant::now();
-            if now >= deadline {
+            if let Some(tier) = deadline.expired(now) {
+                let (byte_count, generation) =
+                    (received_bytes.bytes.len(), received_bytes.generation);
+                drop(received_bytes);
                 panic!(
-                    "timed out waiting for: {}{}\ncursor: {:?}\nlast rendered grid:\n{}\n=== (received {} stdout bytes, generation {}) ===\n=== zellij log tail ({}) ===\n{}",
+                    "timed out waiting for: {}{}\n{}\ncursor: {:?}\nlast rendered grid:\n{}\n=== (received {} stdout bytes, generation {}) ===\n=== zellij log tail ({}) ===\n{}",
                     what,
                     if grid_snapshot.bars_partially_drawn() {
                         " (the status bar drew but the tab bar row stayed blank)"
                     } else {
                         ""
                     },
+                    deadline.explain(tier, now),
                     grid_snapshot.cursor,
                     grid_snapshot.text,
-                    received_bytes.bytes.len(),
-                    received_bytes.generation,
+                    byte_count,
+                    generation,
                     crate::test_env::log_file_path().display(),
                     crate::test_env::log_tail(40),
                 );
@@ -210,11 +241,11 @@ impl ClientScreen {
             let (guard, _) = self
                 .inner
                 .change_signal
-                .wait_timeout(received_bytes, deadline - now)
+                .wait_timeout(received_bytes, deadline.remaining(now))
                 .unwrap();
             received_bytes = guard;
-            if received_bytes.generation == last_generation {
-                continue;
+            if received_bytes.generation != last_generation {
+                deadline.note_progress(Instant::now());
             }
         }
     }
@@ -226,15 +257,31 @@ struct ClientScreenWriter {
 
 impl std::io::Write for ClientScreenWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut received_bytes = self.inner.received_bytes.lock().unwrap();
+        let mut received_bytes = self
+            .inner
+            .received_bytes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         received_bytes.bytes.extend_from_slice(buf);
         received_bytes.generation += 1;
-        if let Some(stdout_tap) = self.inner.stdout_tap.lock().unwrap().as_ref() {
+        if let Some(stdout_tap) = self
+            .inner
+            .stdout_tap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
             let _ = stdout_tap.send(buf.to_vec());
         }
         self.inner.change_signal.notify_all();
         drop(received_bytes);
-        if let Some(host_responder) = self.inner.host_responder.lock().unwrap().as_mut() {
+        if let Some(host_responder) = self
+            .inner
+            .host_responder
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_mut()
+        {
             host_responder.observe(buf);
         }
         Ok(buf.len())
@@ -276,6 +323,7 @@ pub struct CellStyle {
     pub italic: bool,
     pub bold: bool,
     pub foreground: Option<AnsiCode>,
+    pub background: Option<AnsiCode>,
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +371,12 @@ impl GridSnapshot {
     }
     pub fn row_of_line(&self, needle: &str) -> Option<usize> {
         self.text.lines().position(|line| line.contains(needle))
+    }
+    pub fn position_of(&self, needle: &str) -> Option<(usize, usize)> {
+        self.text.lines().enumerate().find_map(|(row, line)| {
+            line.find(needle)
+                .map(|byte_index| (line[..byte_index].chars().count(), row))
+        })
     }
     pub fn region_has_dim(
         &self,
@@ -384,7 +438,7 @@ impl std::fmt::Display for GridSnapshot {
     }
 }
 
-fn render_bytes(bytes: &[u8], win_size: Size) -> GridSnapshot {
+pub fn render_bytes(bytes: &[u8], win_size: Size) -> GridSnapshot {
     let mut terminal_pane = build_terminal_pane(win_size);
     let mut vte_parser = vte::Parser::new();
     vte_parser.advance(&mut terminal_pane.grid, bytes);
@@ -410,6 +464,7 @@ fn render_bytes(bytes: &[u8], win_size: Size) -> GridSnapshot {
                 italic: matches!(character_style.italic, Some(AnsiCode::On)),
                 bold: matches!(character_style.bold, Some(AnsiCode::On)),
                 foreground: character_style.foreground,
+                background: character_style.background,
             });
             let character_position = CursorPosition {
                 x: character_index,
@@ -419,7 +474,7 @@ fn render_bytes(bytes: &[u8], win_size: Size) -> GridSnapshot {
                 text.push('█');
                 continue;
             }
-            text.push(terminal_character.character);
+            terminal_character.push_text_to(&mut text);
         }
         styles.push(style_row);
         if line_index != output_lines.len() - 1 {

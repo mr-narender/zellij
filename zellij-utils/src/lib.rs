@@ -1,10 +1,13 @@
+pub mod attention;
 pub mod cli;
 pub mod client_server_contract;
 pub mod consts;
 pub mod data;
+pub mod desktop_integration;
 pub mod distribution;
 pub mod envs;
 pub mod errors;
+pub mod graphemes;
 pub mod home;
 #[cfg(not(windows))]
 mod home_unix;
@@ -16,11 +19,16 @@ pub mod nested_session_contract;
 pub mod pane_size;
 pub mod plugin_api;
 pub mod position;
+pub mod prompt;
+pub mod session_history;
 pub mod session_serialization;
 pub mod setup;
 pub mod shared;
+pub mod structured_render;
 
 // The following modules can't be used when targeting wasm
+#[cfg(not(target_family = "wasm"))]
+pub mod app_control;
 #[cfg(not(target_family = "wasm"))]
 pub mod channels; // Requires tokio
 #[cfg(not(target_family = "wasm"))]
@@ -33,8 +41,14 @@ pub mod ipc; // Requires interprocess
 pub mod logging; // Requires log4rs
 #[cfg(not(target_family = "wasm"))]
 pub mod nested_session;
+#[cfg(not(target_family = "wasm"))]
+pub mod pane_mirror;
 #[cfg(all(not(target_family = "wasm"), feature = "web_server_capability"))]
 pub mod remote_session_tokens;
+#[cfg(not(target_family = "wasm"))]
+pub mod session_index;
+#[cfg(not(target_family = "wasm"))]
+pub mod session_link;
 #[cfg(not(target_family = "wasm"))]
 pub mod sessions;
 #[cfg(all(not(target_family = "wasm"), feature = "web_server_capability"))]

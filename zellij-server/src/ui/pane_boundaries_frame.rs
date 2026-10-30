@@ -15,18 +15,25 @@ use zellij_utils::errors::prelude::*;
 use zellij_utils::pane_size::{Offset, PaneGeom, Viewport};
 use zellij_utils::position::Position;
 
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
+use zellij_utils::graphemes;
 
 fn styled_characters(
     characters: &str,
     style_character: impl Fn(&mut CharacterStyles),
 ) -> Vec<TerminalCharacter> {
-    characters
-        .chars()
-        .map(|character| {
-            let mut styles = RcCharacterStyles::reset();
-            styles.update(|styles| style_character(styles));
-            TerminalCharacter::new_styled(character, styles)
+    let mut styles = RcCharacterStyles::reset();
+    styles.update(|styles| style_character(styles));
+    if characters.is_ascii() {
+        return characters
+            .chars()
+            .map(|character| TerminalCharacter::new_styled(character, styles.clone()))
+            .collect();
+    }
+    graphemes::clusters(characters)
+        .filter(|(_, width)| *width > 0)
+        .filter_map(|(cluster, width)| {
+            TerminalCharacter::from_cluster(cluster, width, styles.clone())
         })
         .collect()
 }
@@ -138,6 +145,14 @@ pub struct PaneFrame {
     mouse_hover_tips: bool,
     dimmed: bool,
     guest_choice_indicator: Option<GuestChoiceIndicator>,
+    attention_marker: Option<FrameAttentionMarker>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameAttentionMarker {
+    pub text: String,
+    pub color: Option<PaletteColor>,
+    pub dim: bool,
 }
 
 impl PaneFrame {
@@ -179,7 +194,14 @@ impl PaneFrame {
             mouse_hover_tips: frame_params.mouse_hover_tips,
             dimmed: frame_params.dimmed,
             guest_choice_indicator: frame_params.guest_choice_indicator,
+            attention_marker: None,
         }
+    }
+    pub fn omits_title(&self) -> bool {
+        self.omit_title
+    }
+    pub fn set_attention_marker(&mut self, marker: Option<FrameAttentionMarker>) {
+        self.attention_marker = marker;
     }
     pub fn is_pinned(mut self, is_pinned: bool) -> Self {
         self.is_pinned = is_pinned;
@@ -513,51 +535,62 @@ impl PaneFrame {
         }
     }
     fn render_title_left_side(&self, max_length: usize) -> Option<(Vec<TerminalCharacter>, usize)> {
+        let Some(marker) = self.attention_marker.as_ref() else {
+            return self.render_text_left_side(&self.title, max_length);
+        };
+        if max_length <= 6 || self.title.is_empty() {
+            return self.render_text_left_side(&self.title, max_length);
+        }
+        let marker_text = format!("{} ", marker.text);
+        let marker_width = marker_text.width();
+        let (mut title_chars, title_width) =
+            self.render_text_left_side(&self.title, max_length.saturating_sub(marker_width))?;
+        let marker_chars = if marker.dim {
+            dimmed_foreground_color(&marker_text, marker.color)
+        } else {
+            foreground_color(&marker_text, marker.color)
+        };
+        title_chars.extend(marker_chars);
+        Some((title_chars, title_width + marker_width))
+    }
+    fn render_text_left_side(
+        &self,
+        title: &str,
+        max_length: usize,
+    ) -> Option<(Vec<TerminalCharacter>, usize)> {
         let middle_truncated_sign = "[..]";
         let middle_truncated_sign_long = "[...]";
-        let full_text = format!(" {} ", &self.title);
-        if max_length <= 6 || self.title.is_empty() {
+        let full_text = format!(" {} ", title);
+        if max_length <= 6 || title.is_empty() {
             None
-        } else if full_text.width() <= max_length {
-            Some((foreground_color(&full_text, self.color), full_text.width()))
+        } else if graphemes::display_width(&full_text) <= max_length {
+            Some((
+                foreground_color(&full_text, self.color),
+                graphemes::display_width(&full_text),
+            ))
         } else {
             let length_of_each_half = (max_length - middle_truncated_sign.width()) / 2;
+            let (first_part, first_part_width) =
+                graphemes::prefix_within(&full_text, length_of_each_half);
+            let (second_part, second_part_width) =
+                graphemes::suffix_within(&full_text, length_of_each_half);
 
-            let mut first_part: String = String::new();
-            for char in full_text.chars() {
-                if first_part.width() + char.width().unwrap_or(0) > length_of_each_half {
-                    break;
-                } else {
-                    first_part.push(char);
-                }
-            }
-
-            let mut second_part: String = String::new();
-            for char in full_text.chars().rev() {
-                if second_part.width() + char.width().unwrap_or(0) > length_of_each_half {
-                    break;
-                } else {
-                    second_part.insert(0, char);
-                }
-            }
-
-            let (title_left_side, title_length) = if first_part.width()
+            let (title_left_side, title_length) = if first_part_width
                 + middle_truncated_sign.width()
-                + second_part.width()
+                + second_part_width
                 < max_length
             {
-                // this means we lost 1 character when dividing the total length into halves
                 (
                     format!(
                         "{}{}{}",
                         first_part, middle_truncated_sign_long, second_part
                     ),
-                    first_part.width() + middle_truncated_sign_long.width() + second_part.width(),
+                    first_part_width + middle_truncated_sign_long.width() + second_part_width,
                 )
             } else {
                 (
                     format!("{}{}{}", first_part, middle_truncated_sign, second_part),
-                    first_part.width() + middle_truncated_sign.width() + second_part.width(),
+                    first_part_width + middle_truncated_sign.width() + second_part_width,
                 )
             };
             Some((foreground_color(&title_left_side, self.color), title_length))
@@ -811,20 +844,7 @@ impl PaneFrame {
         let inner_width = entry
             .width
             .min(usable_cols.saturating_sub(marker_width + corner_overhead));
-        let content = if entry.label.width() <= inner_width {
-            entry.label.clone()
-        } else {
-            let truncation_budget = inner_width.saturating_sub(1);
-            let mut truncated = String::new();
-            for character in entry.label.chars() {
-                if truncated.width() + character.width().unwrap_or(0) > truncation_budget {
-                    break;
-                }
-                truncated.push(character);
-            }
-            truncated.push('…');
-            truncated
-        };
+        let content = graphemes::truncate_end(&entry.label, inner_width, "…").into_owned();
         let full_width_entry_length = marker_width + corner_overhead + inner_width;
         let entry_start = usable_cols.saturating_sub(full_width_entry_length) / 2;
         let left_budget = entry_start;
@@ -858,7 +878,7 @@ impl PaneFrame {
             line.push(EMPTY_TERMINAL_CHARACTER);
         }
         line.append(&mut style_entry_text(&content));
-        let content_padding = inner_width.saturating_sub(content.width());
+        let content_padding = inner_width.saturating_sub(graphemes::display_width(&content));
         for _ in 0..content_padding {
             line.push(EMPTY_TERMINAL_CHARACTER);
         }
@@ -907,7 +927,10 @@ impl PaneFrame {
     }
     fn bracketed_title_part(&self, content: &str) -> (Vec<TerminalCharacter>, usize) {
         let text = format!(" [ {} ] ", content);
-        (foreground_color(&text, self.color), text.width())
+        (
+            foreground_color(&text, self.color),
+            graphemes::display_width(&text),
+        )
     }
     fn bracketed_title_part_from_characters(
         &self,
@@ -921,7 +944,10 @@ impl PaneFrame {
     }
     fn plain_title_part(&self, content: &str) -> (Vec<TerminalCharacter>, usize) {
         let text = format!(" {} ", content);
-        (foreground_color(&text, self.color), text.width())
+        (
+            foreground_color(&text, self.color),
+            graphemes::display_width(&text),
+        )
     }
     fn bracketed_pane_title(&self, max_length: usize) -> Option<(Vec<TerminalCharacter>, usize)> {
         let title_padding = 2;
@@ -934,21 +960,28 @@ impl PaneFrame {
             .then(|| self.first_exited_held_title_part_full());
         let exit_length = exit_part.as_ref().map(|(_, length)| *length).unwrap_or(0);
         let content_max_length = max_length.saturating_sub(title_padding + exit_length);
-        let content = if self.title.width() <= content_max_length {
-            self.title.clone()
-        } else {
-            let truncation_budget = content_max_length.saturating_sub(1);
-            let mut truncated = String::new();
-            for character in self.title.chars() {
-                if truncated.width() + character.width().unwrap_or(0) > truncation_budget {
-                    break;
-                }
-                truncated.push(character);
+        let marker_part = self.attention_marker.as_ref().and_then(|marker| {
+            if content_max_length < graphemes::display_width(&marker.text) + 4 {
+                return None;
             }
-            truncated.push('…');
-            truncated
-        };
+            let text = marker.text.clone();
+            let mut characters = if marker.dim {
+                dimmed_foreground_color(&text, marker.color)
+            } else {
+                foreground_color(&text, marker.color)
+            };
+            characters.append(&mut foreground_color(" ", self.color));
+            let width = graphemes::display_width(&text) + 1;
+            Some((characters, width))
+        });
+        let marker_length = marker_part.as_ref().map(|(_, length)| *length).unwrap_or(0);
+        let content_max_length = content_max_length.saturating_sub(marker_length);
+        let content = graphemes::truncate_end(&self.title, content_max_length, "…").into_owned();
         let (mut part, mut length) = self.plain_title_part(&content);
+        if let Some((mut marker, marker_length)) = marker_part {
+            part.append(&mut marker);
+            length += marker_length;
+        }
         if let Some((mut exit, exit_length)) = exit_part {
             part.append(&mut exit);
             length += exit_length;
@@ -1127,7 +1160,7 @@ impl PaneFrame {
 
         let tooltip_text = self.highlight_tooltip.as_deref().unwrap_or("");
         let text = format!(" Alt <Click> - {} ", tooltip_text);
-        let text_len = text.chars().count();
+        let text_len = graphemes::display_width(&text);
         if text_len > max_undertitle_length {
             return Ok(self.empty_undertitle(max_undertitle_length));
         }
@@ -1296,7 +1329,7 @@ impl PaneFrame {
         };
         Ok(res)
     }
-    pub fn clicked_on_pinned(&mut self, position: Position) -> bool {
+    pub fn clicked_on_pinned(&self, position: Position) -> bool {
         if self.is_floating {
             // TODO: this is not entirely accurate because our relative position calculation in
             // itself isn't - when that is fixed, we should adjust this as well
@@ -1536,7 +1569,126 @@ mod tests {
     }
 
     fn characters_to_string(chars: &[TerminalCharacter]) -> String {
-        chars.iter().map(|c| c.character).collect()
+        let mut text = String::new();
+        for c in chars {
+            c.push_text_to(&mut text);
+        }
+        text
+    }
+
+    const CLUSTER_TITLE: &str =
+        "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467} caf\u{0065}\u{0301} \u{1F1E9}\u{1F1EA} \u{4F60}\u{597D} end";
+
+    fn title_frame(title: &str, cols: usize, framed: bool) -> PaneFrame {
+        let mut frame = pane_frame_with(false, false, cols);
+        frame.title = title.to_string();
+        frame.geom.rows = 3;
+        frame.mouse_hover_tips = false;
+        frame.show_help_text = false;
+        frame.should_draw_pane_frames = framed;
+        frame
+    }
+
+    fn first_row(frame: &PaneFrame) -> Vec<TerminalCharacter> {
+        let (chunks, _) = frame.render().unwrap();
+        let mut row: Vec<&CharacterChunk> = chunks.iter().filter(|c| c.y == 0).collect();
+        row.sort_by_key(|c| c.x);
+        row.iter()
+            .flat_map(|c| c.terminal_characters.iter().cloned())
+            .collect()
+    }
+
+    fn assert_cells_are_whole_clusters(cells: &[TerminalCharacter], title: &str) {
+        let allowed: Vec<&str> = graphemes::clusters(title).map(|(c, _)| c).collect();
+        for cell in cells {
+            let text = cell.text().into_owned();
+            if text.chars().count() > 1 {
+                assert!(allowed.contains(&text.as_str()), "split cluster {:?}", text);
+            }
+            assert!(
+                !text.starts_with('\u{200D}') && !text.starts_with('\u{0301}'),
+                "cell starts with a zero-width code point: {:?}",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn titles_with_clusters_fill_exactly_the_frame_width() {
+        for cols in 8..40 {
+            let frame = title_frame(CLUSTER_TITLE, cols, true);
+            let cells = first_row(&frame);
+            let width: usize = cells.iter().map(|c| c.width()).sum();
+            assert_eq!(
+                width,
+                cols,
+                "cols={} row={:?}",
+                cols,
+                characters_to_string(&cells)
+            );
+            assert_cells_are_whole_clusters(&cells, CLUSTER_TITLE);
+            let last = cells.last().unwrap().text().into_owned();
+            assert!(last == "┐" || last == "╮", "cols={} last={:?}", cols, last);
+        }
+    }
+
+    #[test]
+    fn frameless_one_line_titles_with_clusters_fill_exactly_the_width() {
+        for cols in 4..40 {
+            let frame = title_frame(CLUSTER_TITLE, cols, false);
+            let cells = first_row(&frame);
+            let width: usize = cells.iter().map(|c| c.width()).sum();
+            assert!(
+                width <= cols,
+                "cols={} row={:?}",
+                cols,
+                characters_to_string(&cells)
+            );
+            assert_cells_are_whole_clusters(&cells, CLUSTER_TITLE);
+        }
+    }
+
+    #[test]
+    fn stacked_list_entries_with_clusters_fill_exactly_the_width() {
+        for cols in 10..40 {
+            let mut frame = title_frame(CLUSTER_TITLE, cols, true);
+            frame.stack_list_entry = Some(StackListEntry {
+                width: graphemes::display_width(CLUSTER_TITLE),
+                label: CLUSTER_TITLE.to_string(),
+                is_selected: true,
+                is_emphasized: false,
+                stack_is_focused: true,
+            });
+            let cells = frame.render_stack_list_entry(frame.stack_list_entry.as_ref().unwrap());
+            let width: usize = cells.iter().map(|c| c.width()).sum();
+            assert_eq!(
+                width,
+                cols,
+                "cols={} row={:?}",
+                cols,
+                characters_to_string(&cells)
+            );
+            assert_cells_are_whole_clusters(&cells, CLUSTER_TITLE);
+        }
+    }
+
+    #[test]
+    fn floating_and_pinned_titles_with_clusters_fill_exactly_the_width() {
+        for cols in 12..40 {
+            let mut frame = title_frame(CLUSTER_TITLE, cols, true);
+            frame.is_floating = true;
+            frame.is_pinned = true;
+            let cells = first_row(&frame);
+            let width: usize = cells.iter().map(|c| c.width()).sum();
+            assert_eq!(
+                width,
+                cols,
+                "cols={} row={:?}",
+                cols,
+                characters_to_string(&cells)
+            );
+            assert_cells_are_whole_clusters(&cells, CLUSTER_TITLE);
+        }
     }
 
     fn frame_rows(border_style: BorderStyle) -> Vec<String> {

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, RwLock};
 use tokio::sync::oneshot;
 
+use crate::background_jobs::BackgroundJob;
 use crate::global_async_runtime::get_tokio_runtime;
 use crate::thread_bus::ThreadSenders;
 use crate::{
@@ -18,9 +19,9 @@ use uuid::Uuid;
 use zellij_utils::{
     channels::SenderWithContext,
     data::{
-        BareKey, ConnectToSession, Direction, Event, InputMode, KeyModifier, ListPanesResponse,
-        ListTabsResponse, NewPanePlacement, PaneListEntry, ResizeStrategy, TabInfo,
-        UnblockCondition,
+        BareKey, ConnectToSession, Direction, Event, GetFocusedPaneInfoResponse, InputMode,
+        KeyModifier, ListPanesResponse, ListTabsResponse, NewPanePlacement, PaneListEntry,
+        ResizeStrategy, TabInfo, UnblockCondition,
     },
     envs,
     errors::{prelude::*, ErrorContext},
@@ -34,6 +35,10 @@ use zellij_utils::{
 };
 
 use crate::ClientId;
+
+mod popup_keys;
+pub(crate) use popup_keys::PopupKeyAction;
+pub use popup_keys::PopupScroll;
 
 const ACTION_COMPLETION_TIMEOUT: Duration = Duration::from_secs(1);
 
@@ -88,6 +93,42 @@ pub fn wait_for_action_completion(
                 }
             },
         }
+    }
+}
+
+fn wait_for_cli_action_completion(
+    receiver: oneshot::Receiver<ActionCompletionResult>,
+    action_name: &str,
+) -> ActionCompletionResult {
+    let runtime = get_tokio_runtime();
+    match runtime
+        .block_on(async { tokio::time::timeout(ACTION_COMPLETION_TIMEOUT, receiver).await })
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => ActionCompletionResult {
+            exit_status: None,
+            affected_pane_id: None,
+            affected_tab_id: None,
+            error_message: None,
+            stdout_message: None,
+        },
+        Err(_) => {
+            log::error!(
+                "Action {} did not complete within {:?} timeout",
+                action_name,
+                ACTION_COMPLETION_TIMEOUT
+            );
+            ActionCompletionResult {
+                exit_status: None,
+                affected_pane_id: None,
+                affected_tab_id: None,
+                error_message: Some(format!(
+                    "Action {} did not complete within {:?}, its outcome is unknown",
+                    action_name, ACTION_COMPLETION_TIMEOUT
+                )),
+                stdout_message: None,
+            }
+        },
     }
 }
 
@@ -159,6 +200,10 @@ impl NotificationEnd {
         self.affected_pane_id = Some(pane_id);
     }
 
+    pub fn clear_affected_pane_id(&mut self) {
+        self.affected_pane_id = None;
+    }
+
     pub fn set_affected_tab_id(&mut self, tab_id: usize) {
         self.affected_tab_id = Some(tab_id);
     }
@@ -217,7 +262,132 @@ fn new_pane_routing(
     }
 }
 
+fn spawns_command_pane(action: &Action) -> bool {
+    match action {
+        Action::NewFloatingPane { command, .. }
+        | Action::NewInPlacePane { command, .. }
+        | Action::NewStackedPane { command, .. }
+        | Action::NewTiledPane { command, .. } => command.is_some(),
+        Action::RunInBackground { .. } => true,
+        _ => false,
+    }
+}
+
+fn action_presses_escape(action: &Action) -> bool {
+    match action {
+        Action::Write {
+            key_with_modifier,
+            bytes,
+            ..
+        } => match key_with_modifier {
+            Some(key) => key.bare_key == BareKey::Esc && key.has_no_modifiers(),
+            None => bytes.as_slice() == [0x1b],
+        },
+        _ => false,
+    }
+}
+
+fn focused_pane_id(senders: &ThreadSenders, client_id: ClientId) -> Option<PaneId> {
+    let (response_sender, response_receiver) = crossbeam::channel::bounded(1);
+    senders
+        .send_to_screen(ScreenInstruction::GetFocusedPaneInfo {
+            client_id,
+            response_channel: response_sender,
+        })
+        .ok()?;
+    match response_receiver.recv_timeout(Duration::from_millis(100)) {
+        Ok(GetFocusedPaneInfoResponse::Ok { pane_id, .. }) => Some(pane_id.into()),
+        Ok(GetFocusedPaneInfoResponse::Err(_)) => None,
+        Err(e) => {
+            log::error!(
+                "Failed to get focused pane for client {}: {:?}",
+                client_id,
+                e
+            );
+            None
+        },
+    }
+}
+
+fn action_submits_input(action: &Action) -> bool {
+    match action {
+        Action::Write {
+            key_with_modifier,
+            bytes,
+            ..
+        } => {
+            key_with_modifier
+                .as_ref()
+                .map(|key| key.bare_key == BareKey::Enter && key.has_no_modifiers())
+                .unwrap_or(false)
+                || bytes.iter().any(|byte| *byte == b'\r' || *byte == b'\n')
+        },
+        Action::WriteChars { chars } => chars.contains('\r') || chars.contains('\n'),
+        _ => false,
+    }
+}
+
 pub(crate) fn route_action(
+    action: Action,
+    client_id: ClientId,
+    cli_client_id: Option<ClientId>,
+    pane_id: Option<PaneId>,
+    senders: ThreadSenders,
+    default_shell: Option<TerminalAction>,
+    seen_cli_pipes: Option<&mut HashSet<String>>,
+    default_mode: InputMode,
+    os_input: Option<Box<dyn ServerOsApi>>,
+    is_cli_client: bool,
+) -> Result<(bool, Option<ActionCompletionResult>)> {
+    route_action_with_origin(
+        action,
+        client_id,
+        cli_client_id,
+        pane_id,
+        senders,
+        default_shell,
+        seen_cli_pipes,
+        default_mode,
+        os_input,
+        is_cli_client,
+        None,
+    )
+}
+
+pub(crate) fn route_bound_mouse_action(
+    action: Action,
+    client_id: ClientId,
+    senders: ThreadSenders,
+    default_shell: Option<TerminalAction>,
+    default_mode: InputMode,
+) -> Result<(bool, Option<ActionCompletionResult>)> {
+    let _ = senders.send_to_plugin(PluginInstruction::UserInput {
+        client_id,
+        action: action.clone(),
+        terminal_id: None,
+        cli_client_id: None,
+    });
+    let origin_pane_id = if spawns_command_pane(&action) {
+        focused_pane_id(&senders, client_id)
+    } else {
+        None
+    };
+    route_action_with_origin(
+        action,
+        client_id,
+        None,
+        None,
+        senders,
+        default_shell,
+        None,
+        default_mode,
+        None,
+        false,
+        origin_pane_id,
+    )
+}
+
+fn route_action_with_origin(
     action: Action,
     client_id: ClientId,
     cli_client_id: Option<ClientId>,
@@ -227,6 +397,8 @@ pub(crate) fn route_action(
     mut seen_cli_pipes: Option<&mut HashSet<String>>,
     default_mode: InputMode,
     os_input: Option<Box<dyn ServerOsApi>>,
+    is_cli_client: bool,
+    origin_pane_id: Option<PaneId>,
 ) -> Result<(bool, Option<ActionCompletionResult>)> {
     let mut should_break = false;
     let err_context = || format!("failed to route action for client {client_id}");
@@ -242,6 +414,15 @@ pub(crate) fn route_action(
                 Event::InputReceived,
             )]))
             .with_context(err_context)?;
+        if crate::session_suggestions::should_report_activity() {
+            let _ = senders.send_to_background_jobs(BackgroundJob::SessionSuggestions(
+                crate::session_suggestions::SessionSuggestionsJob::Activity,
+            ));
+        }
+    }
+    let submits_terminal_input = cli_client_id.is_none() && action_submits_input(&action);
+    if cli_client_id.is_none() && action_presses_escape(&action) {
+        let _ = senders.send_to_screen(ScreenInstruction::TerminalEscapePressed(client_id));
     }
 
     // we use this oneshot channel to wait for an action to be "logically"
@@ -668,6 +849,41 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::ToggleBars { bars } => {
+            senders
+                .send_to_screen(ScreenInstruction::ToggleBars(
+                    bars,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::HideBars { bars } => {
+            senders
+                .send_to_screen(ScreenInstruction::HideBars(
+                    bars,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::ShowBars => {
+            senders
+                .send_to_screen(ScreenInstruction::ShowBars(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::HideBarByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::HideBarByPaneId(
+                    pane_id.into(),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::NewPane {
             direction,
             pane_name,
@@ -694,6 +910,7 @@ pub(crate) fn route_action(
                     ClientTabIndexOrPaneId::ClientId(client_id),
                     Some(NotificationEnd::new(completion_tx)),
                     false, // set_blocking
+                    None,
                 ))
                 .with_context(err_context)?;
         },
@@ -747,6 +964,7 @@ pub(crate) fn route_action(
                     client_tab_index_or_paneid,
                     notification_end,
                     set_pane_blocking,
+                    None,
                 ))
                 .with_context(err_context)?;
             wait_forever = true;
@@ -774,6 +992,7 @@ pub(crate) fn route_action(
                     close_replaced_pane,
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
+                    None,
                 )
             } else {
                 let client_tab_index_or_paneid =
@@ -798,6 +1017,7 @@ pub(crate) fn route_action(
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
                     false, // set_blocking
+                    None,
                 )
             };
             senders.send_to_pty(pty_instr).with_context(err_context)?;
@@ -839,6 +1059,7 @@ pub(crate) fn route_action(
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
                     false, // set_blocking
+                    origin_pane_id,
                 ))
                 .with_context(err_context)?;
         },
@@ -879,6 +1100,7 @@ pub(crate) fn route_action(
                     close_replaced_pane,
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
+                    origin_pane_id,
                 ))
                 .with_context(err_context)?;
         },
@@ -939,6 +1161,7 @@ pub(crate) fn route_action(
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
                     false, // set_blocking
+                    origin_pane_id,
                 ))
                 .with_context(err_context)?;
         },
@@ -970,6 +1193,7 @@ pub(crate) fn route_action(
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
                     false, // set_blocking
+                    origin_pane_id,
                 ))
                 .with_context(err_context)?;
         },
@@ -1028,7 +1252,36 @@ pub(crate) fn route_action(
                     client_tab_index_or_paneid,
                     Some(NotificationEnd::new(completion_tx)),
                     false, // set_blocking
+                    None,
                 ))
+                .with_context(err_context)?;
+        },
+        Action::SetResurrectCommand { pane_id, resurrect } => match pane_id {
+            zellij_utils::data::PaneId::Terminal(terminal_id) => {
+                senders
+                    .send_to_pty(PtyInstruction::SetResurrectCommand {
+                        terminal_id,
+                        resurrect,
+                        completion_tx: Some(NotificationEnd::new(completion_tx)),
+                    })
+                    .with_context(err_context)?;
+            },
+            zellij_utils::data::PaneId::Plugin(plugin_id) => {
+                let mut notification = NotificationEnd::new(completion_tx);
+                notification.set_error_message(format!(
+                    "Pane plugin_{} is a plugin pane, a resurrect command can only be set for terminal panes",
+                    plugin_id
+                ));
+            },
+        },
+        Action::RunInBackground { command } => {
+            senders
+                .send_to_pty(PtyInstruction::RunInBackground {
+                    command,
+                    client_id,
+                    origin_pane_id: origin_pane_id.or(pane_id),
+                    completion_tx: Some(NotificationEnd::new(completion_tx)),
+                })
                 .with_context(err_context)?;
         },
         Action::CloseFocus => {
@@ -1150,6 +1403,23 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::SessionNameInput { input } => {
+            senders
+                .send_to_screen(ScreenInstruction::UpdateSessionNameDraft(
+                    input,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::UndoRenameSession => {
+            senders
+                .send_to_screen(ScreenInstruction::UndoRenameSession(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::GoToTabById { id } => {
             senders
                 .send_to_screen(ScreenInstruction::GoToTabWithId(
@@ -1163,6 +1433,21 @@ pub(crate) fn route_action(
             senders
                 .send_to_screen(ScreenInstruction::CloseTabWithId(
                     id as usize,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::StartRenameTabByTabId { id } => {
+            senders
+                .send_to_screen(ScreenInstruction::StartRenameTabWithTabId(
+                    id as usize,
+                    client_id,
+                ))
+                .with_context(err_context)?;
+            senders
+                .send_to_server(ServerInstruction::ChangeMode(
+                    client_id,
+                    InputMode::RenameTab,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
@@ -1189,6 +1474,12 @@ pub(crate) fn route_action(
             };
             senders
                 .send_to_screen(screen_instr)
+                .with_context(err_context)?;
+        },
+        Action::Quit if !is_cli_client => {
+            drop(NotificationEnd::new(completion_tx));
+            senders
+                .send_to_screen(ScreenInstruction::ConfirmQuit(client_id))
                 .with_context(err_context)?;
         },
         Action::Quit => {
@@ -1230,12 +1521,225 @@ pub(crate) fn route_action(
                 ))))
                 .with_context(err_context)?;
         },
+        Action::DismissInfoPopups => {
+            senders
+                .send_to_screen(ScreenInstruction::DismissInfoPopups(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::ToggleSessionCard => {
+            senders
+                .send_to_screen(ScreenInstruction::ToggleSessionCard(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::MutePane => {
+            senders
+                .send_to_screen(ScreenInstruction::MutePane(
+                    None,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::MutePaneByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::MutePane(
+                    Some(pane_id),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::IgnorePaneOutput => {
+            senders
+                .send_to_screen(ScreenInstruction::IgnorePaneOutput(
+                    None,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::IgnorePaneOutputByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::IgnorePaneOutput(
+                    Some(pane_id),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::WatchPane => {
+            senders
+                .send_to_screen(ScreenInstruction::WatchPane(
+                    None,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::WatchPaneByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::WatchPane(
+                    Some(pane_id),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::MuteTab => {
+            senders
+                .send_to_screen(ScreenInstruction::MuteTab(
+                    None,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::MuteTabByTabId { id } => {
+            senders
+                .send_to_screen(ScreenInstruction::MuteTab(
+                    Some(id as usize),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::MuteSession => {
+            senders
+                .send_to_screen(ScreenInstruction::MuteSession(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::ToggleSession | Action::GoToPreviousSession | Action::GoToNextSession => {
+            let history_move = match action {
+                Action::ToggleSession => zellij_utils::session_history::HistoryMove::Toggle,
+                Action::GoToPreviousSession => zellij_utils::session_history::HistoryMove::Back,
+                _ => zellij_utils::session_history::HistoryMove::Forward,
+            };
+            senders
+                .send_to_server(ServerInstruction::HistoryMove(
+                    history_move,
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::PasteFromClipboardByPaneId { pane_id } => {
+            drop(NotificationEnd::new(completion_tx));
+            senders
+                .send_to_screen(ScreenInstruction::PasteFromClipboard { client_id, pane_id })
+                .with_context(err_context)?;
+        },
+        Action::OpenSessionInTerminal => {
+            drop(NotificationEnd::new(completion_tx));
+            let session_name = zellij_utils::envs::get_session_name().ok();
+            let _ = std::thread::Builder::new()
+                .name("open_session_in_terminal".to_owned())
+                .spawn(move || {
+                    let request = zellij_utils::app_control::OpenWindowRequest {
+                        session: session_name,
+                        ..Default::default()
+                    };
+                    if let Err(e) = crate::desktop_app::open_window(request) {
+                        log::info!("The session could not be opened in a window: {}", e);
+                    }
+                });
+        },
+        Action::WaitForPaneExit { pane_id } => {
+            let mut notification =
+                NotificationEnd::new_with_condition(completion_tx, UnblockCondition::OnAnyExit);
+            notification.set_exit_status(1);
+            wait_forever = true;
+            senders
+                .send_to_screen(ScreenInstruction::WaitForPaneExit(
+                    pane_id.into(),
+                    notification,
+                ))
+                .with_context(err_context)?;
+        },
+        Action::ToggleTrayIcon => {
+            drop(NotificationEnd::new(completion_tx));
+            let _ = std::thread::Builder::new()
+                .name("toggle_tray_icon".to_owned())
+                .spawn(|| {
+                    if let Err(e) = zellij_utils::app_control::send_app_request(
+                        &zellij_utils::app_control::AppRequest::ToggleTrayIcon,
+                    ) {
+                        log::info!("The desktop app did not take the tray icon toggle: {}", e);
+                    }
+                });
+        },
+        Action::GoToNextAttention => {
+            senders
+                .send_to_screen(ScreenInstruction::GoToNextAttention(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::MarkPaneSeen { session, pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::MarkPaneSeen {
+                    session,
+                    pane_id,
+                    client_id,
+                    completion: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::MarkAllSeen {
+            session,
+            this_session,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::MarkAllSeen {
+                    session,
+                    this_session,
+                    completion: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::WriteKeyToPaneId {
+            key_with_modifier: Some(key_with_modifier),
+            pane_id,
+        } => {
+            senders
+                .send_to_screen(ScreenInstruction::SessionPaneCommand {
+                    session_name: None,
+                    command: crate::screen::SessionPaneCommand::Key(pane_id, key_with_modifier),
+                    client_id,
+                    completion: Some(NotificationEnd::new(completion_tx)),
+                })
+                .with_context(err_context)?;
+        },
+        Action::WriteKeyToPaneId {
+            key_with_modifier: None,
+            ..
+        } => {
+            drop(completion_tx);
+        },
+        Action::OpenContextMenu => {
+            senders
+                .send_to_screen(ScreenInstruction::OpenContextMenu(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::SwitchSession {
             name,
             tab_position,
             pane_id,
             layout,
             cwd,
+            close_current,
         } => {
             let current_session_name = envs::get_session_name().unwrap_or_else(|_| String::new());
             if name != current_session_name {
@@ -1245,13 +1749,23 @@ pub(crate) fn route_action(
                     pane_id: pane_id.clone(),
                     layout: layout.clone(),
                     cwd: cwd.clone(),
+                    switch_context: None,
                 };
-                senders
-                    .send_to_server(ServerInstruction::SwitchSession(
+                let instruction = if close_current {
+                    ServerInstruction::SwitchSessionAndCloseCurrent(
                         connect_to_session,
                         client_id,
                         Some(NotificationEnd::new(completion_tx)),
-                    ))
+                    )
+                } else {
+                    ServerInstruction::SwitchSession(
+                        connect_to_session,
+                        client_id,
+                        Some(NotificationEnd::new(completion_tx)),
+                    )
+                };
+                senders
+                    .send_to_server(instruction)
                     .with_context(err_context)?;
                 should_break = true;
             } else {
@@ -1260,7 +1774,7 @@ pub(crate) fn route_action(
         },
         Action::MouseEvent { event } => {
             senders
-                .send_to_screen(ScreenInstruction::MouseEvent(
+                .send_to_screen_priority(ScreenInstruction::MouseEvent(
                     event,
                     client_id,
                     Some(NotificationEnd::new(completion_tx)),
@@ -1343,6 +1857,9 @@ pub(crate) fn route_action(
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
+            senders
+                .send_to_screen(ScreenInstruction::ShowSwapLayoutNotification(client_id))
+                .with_context(err_context)?;
         },
         Action::NextSwapLayout => {
             senders
@@ -1350,6 +1867,9 @@ pub(crate) fn route_action(
                     client_id,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
+                .with_context(err_context)?;
+            senders
+                .send_to_screen(ScreenInstruction::ShowSwapLayoutNotification(client_id))
                 .with_context(err_context)?;
         },
         Action::ApplyTiledSwapLayout { name } => {
@@ -1691,6 +2211,10 @@ pub(crate) fn route_action(
             skip_cache,
             cwd,
             pane_title,
+            popup,
+            popup_no_focus,
+            popup_capture_all_keys,
+            popup_outside_click,
             ..
         } => {
             drop(completion_tx); // releasing pipes is handled by the plugins, so we don't want
@@ -1726,6 +2250,11 @@ pub(crate) fn route_action(
                         pane_title,
                         skip_cache,
                         cli_client_id: cli_client_id.unwrap_or(client_id),
+                        caller_pane_id: pane_id,
+                        popup,
+                        popup_focused: !popup_no_focus,
+                        popup_capture_all_keys,
+                        popup_outside_click: popup_outside_click.unwrap_or_default(),
                     })
                     .with_context(err_context)?;
             } else {
@@ -1888,6 +2417,14 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::ToggleMirrorResize => {
+            senders
+                .send_to_screen(ScreenInstruction::ToggleMirrorResize(
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
         Action::StackPanes {
             pane_ids: pane_ids_to_stack,
         } => {
@@ -1906,6 +2443,7 @@ pub(crate) fn route_action(
             senders
                 .send_to_screen(ScreenInstruction::ChangeFloatingPanesCoordinates(
                     vec![(pane_id.into(), coordinates)],
+                    true,
                     Some(NotificationEnd::new(completion_tx)),
                 ))
                 .with_context(err_context)?;
@@ -2232,8 +2770,48 @@ pub(crate) fn route_action(
                 ))
                 .with_context(err_context)?;
         },
+        Action::MoveTabToPosition { id, position } => {
+            senders
+                .send_to_screen(ScreenInstruction::MoveTabToPosition(
+                    id as usize,
+                    usize::try_from(position).unwrap_or(usize::MAX),
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::TogglePaneInGroupByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::TogglePaneIdInGroup(
+                    pane_id.into(),
+                    client_id,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
+        Action::StartRenamePaneByPaneId { pane_id } => {
+            senders
+                .send_to_screen(ScreenInstruction::StartRenamePaneWithPaneId(
+                    pane_id.into(),
+                    client_id,
+                ))
+                .with_context(err_context)?;
+            senders
+                .send_to_server(ServerInstruction::ChangeMode(
+                    client_id,
+                    InputMode::RenamePane,
+                    Some(NotificationEnd::new(completion_tx)),
+                ))
+                .with_context(err_context)?;
+        },
     }
-    let result = wait_for_action_completion(completion_rx, &action_name, wait_forever);
+    if submits_terminal_input {
+        let _ = senders.send_to_screen(ScreenInstruction::TerminalInputSubmitted(client_id));
+    }
+    let result = if is_cli_client && !wait_forever {
+        wait_for_cli_action_completion(completion_rx, &action_name)
+    } else {
+        wait_for_action_completion(completion_rx, &action_name, wait_forever)
+    };
     if let Some(error_message) = &result.error_message {
         if let Some(cli_client_id) = cli_client_id {
             if let Some(ref os_input) = os_input {
@@ -2333,6 +2911,21 @@ macro_rules! send_to_screen_or_retry_queue {
     }};
 }
 
+macro_rules! send_to_screen_priority_or_retry_queue {
+    ($senders:expr, $message:expr, $instruction: expr, $retry_queue:expr) => {{
+        match $senders.as_ref() {
+            Some(senders) => senders.send_to_screen_priority($message),
+            None => {
+                log::warn!("Server not ready, trying to place instruction in retry queue...");
+                if let Some(retry_queue) = $retry_queue.as_mut() {
+                    retry_queue.push_back($instruction);
+                }
+                Ok(())
+            },
+        }
+    }};
+}
+
 pub(crate) fn route_thread_main(
     session_data: Arc<RwLock<Option<SessionMetaData>>>,
     session_state: Arc<RwLock<SessionState>>,
@@ -2406,6 +2999,30 @@ pub(crate) fn route_thread_main(
                                 )
                                 .with_context(err_context)?;
                             },
+                            ClientToServerMsg::StructuredRenderSupport { supported } => {
+                                send_to_screen_or_retry_queue!(
+                                    senders,
+                                    ScreenInstruction::SetStructuredRenderSupport {
+                                        client_id,
+                                        supported: *supported,
+                                    },
+                                    instruction.clone(),
+                                    retry_queue
+                                )
+                                .with_context(err_context)?;
+                            },
+                            ClientToServerMsg::RenderFrameAck { seq } => {
+                                send_to_screen_priority_or_retry_queue!(
+                                    senders,
+                                    ScreenInstruction::RenderFrameAck {
+                                        client_id,
+                                        seq: *seq,
+                                    },
+                                    instruction.clone(),
+                                    retry_queue
+                                )
+                                .with_context(err_context)?;
+                            },
                             _ => {
                                 // Ignore all input from watcher clients
                             },
@@ -2429,46 +3046,118 @@ pub(crate) fn route_thread_main(
                             // The read guard ends as a temporary in this expression so
                             // `route_action` runs without holding `session_data.read()` —
                             // see the doc comment on `route_action` for why this matters.
+                            let live_view_release =
+                                session_data.read().unwrap().as_ref().and_then(|s| {
+                                    s.live_view_captures
+                                        .lock()
+                                        .ok()?
+                                        .key_pressed(client_id, &key, || {
+                                            s.live_view_release_keys(&client_id)
+                                        })
+                                        .then(|| s.senders.clone())
+                                });
+                            if let Some(senders) = live_view_release {
+                                let _ = senders.send_to_screen(
+                                    ScreenInstruction::ReleaseLiveViewInputWithKey(client_id),
+                                );
+                                return Ok(should_break);
+                            }
                             let dispatch_inputs =
                                 session_data.read().unwrap().as_ref().and_then(|s| {
-                                    let in_passthrough =
+                                    let in_key_passthrough =
                                         s.key_passthrough_clients.contains_key(&client_id);
-                                    if in_passthrough {
-                                        return Some((
-                                            s.senders.clone(),
-                                            s.default_shell.clone(),
-                                            s.session_configuration
-                                                .get_client_default_input_mode(&client_id),
-                                            vec![Action::Write {
-                                                key_with_modifier: Some(key),
-                                                bytes: raw_bytes,
-                                                is_kitty_keyboard_protocol,
-                                            }],
-                                        ));
-                                    }
+                                    let live_view_capture = s
+                                        .live_view_captures
+                                        .lock()
+                                        .map(|captures| captures.is_capturing(client_id))
+                                        .unwrap_or(false);
+                                    let has_focused_popup = !live_view_capture
+                                        && s.popup_clients.contains(&client_id);
+                                    let popup_takes_all_keys = !live_view_capture
+                                        && s.modal_popup_clients.contains(&client_id);
                                     let (kb, im, dim) =
                                         s.get_client_keybinds_and_mode(&client_id)?;
-                                    let actions: Vec<Action> = kb
-                                        .get_actions_for_key_in_mode_or_default_action(
-                                            im,
-                                            &key,
-                                            raw_bytes,
-                                            dim,
-                                            is_kitty_keyboard_protocol,
-                                        );
+                                    let key_actions = popup_keys::key_dispatch(
+                                        kb,
+                                        im,
+                                        dim,
+                                        &key,
+                                        raw_bytes,
+                                        is_kitty_keyboard_protocol,
+                                        in_key_passthrough,
+                                        has_focused_popup,
+                                        popup_takes_all_keys,
+                                    );
                                     Some((
                                         s.senders.clone(),
                                         s.default_shell.clone(),
                                         s.session_configuration
                                             .get_client_default_input_mode(&client_id),
-                                        actions,
+                                        key_actions,
                                     ))
                                 });
-                            if let Some((senders, default_shell, client_input_mode, actions)) =
+                            if let Some((senders, default_shell, client_input_mode, key_actions)) =
                                 dispatch_inputs
                             {
-                                for action in actions {
-                                    // Send user input to plugin thread for logging
+                                for key_action in key_actions {
+                                    let action = match key_action {
+                                        PopupKeyAction::Route(action) => action,
+                                        PopupKeyAction::ClosePopup => {
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::CloseTopPopup(client_id),
+                                            );
+                                            continue;
+                                        },
+                                        PopupKeyAction::ScrollPopup(scroll) => {
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::ScrollPopup(client_id, scroll),
+                                            );
+                                            continue;
+                                        },
+                                        PopupKeyAction::KeyToPopup {
+                                            key: popup_key,
+                                            raw_bytes: popup_raw_bytes,
+                                            is_kitty_keyboard_protocol: popup_key_is_kitty,
+                                        } => {
+                                            let _ = senders.send_to_plugin(
+                                                PluginInstruction::UserInput {
+                                                    client_id,
+                                                    action: Action::Write {
+                                                        key_with_modifier: Some(popup_key.clone()),
+                                                        bytes: popup_raw_bytes.clone(),
+                                                        is_kitty_keyboard_protocol:
+                                                            popup_key_is_kitty,
+                                                    },
+                                                    terminal_id: None,
+                                                    cli_client_id: None,
+                                                },
+                                            );
+                                            let _ = senders.send_to_plugin(
+                                                PluginInstruction::Update(vec![(
+                                                    None,
+                                                    Some(client_id),
+                                                    Event::InputReceived,
+                                                )]),
+                                            );
+                                            let (completion_tx, completion_rx) =
+                                                oneshot::channel();
+                                            let _ = senders.send_to_screen(
+                                                ScreenInstruction::KeyToPopup(
+                                                    popup_key,
+                                                    popup_raw_bytes,
+                                                    popup_key_is_kitty,
+                                                    client_id,
+                                                    Some(NotificationEnd::new(completion_tx)),
+                                                ),
+                                            );
+                                            let _ = wait_for_action_completion(
+                                                completion_rx,
+                                                "KeyToPopup",
+                                                false,
+                                            );
+                                            continue;
+                                        },
+                                    };
                                     let _ = senders.send_to_plugin(PluginInstruction::UserInput {
                                         client_id,
                                         action: action.clone(),
@@ -2476,7 +3165,12 @@ pub(crate) fn route_thread_main(
                                         cli_client_id: None,
                                     });
 
-                                    match route_action(
+                                    let origin_pane_id = if spawns_command_pane(&action) {
+                                        focused_pane_id(&senders, client_id)
+                                    } else {
+                                        None
+                                    };
+                                    match route_action_with_origin(
                                         action,
                                         client_id,
                                         None,
@@ -2486,6 +3180,8 @@ pub(crate) fn route_thread_main(
                                         Some(&mut seen_cli_pipes),
                                         client_input_mode,
                                         Some(os_input.clone()),
+                                        false,
+                                        origin_pane_id,
                                     ) {
                                         Ok(route_action_should_break) => {
                                             if route_action_should_break.0 {
@@ -2537,6 +3233,25 @@ pub(crate) fn route_thread_main(
                                 });
                             }
 
+                            let popup_has_focus = !is_cli_client
+                                && session_data
+                                    .read()
+                                    .unwrap()
+                                    .as_ref()
+                                    .map(|s| s.popup_clients.contains(&client_id))
+                                    .unwrap_or(false);
+                            let action = match action {
+                                Action::WriteChars { chars } if popup_has_focus => {
+                                    if let Some(senders) = senders.as_ref() {
+                                        type_into_popup(senders, client_id, &chars);
+                                    }
+                                    return Ok(should_break);
+                                },
+                                Action::Paste { pane_id: None, .. } if popup_has_focus => {
+                                    return Ok(should_break);
+                                },
+                                action => action,
+                            };
                             // The read guard ends as a temporary in this expression so
                             // `route_action` runs without holding `session_data.read()` —
                             // see the doc comment on `route_action` for why this matters.
@@ -2562,6 +3277,7 @@ pub(crate) fn route_thread_main(
                                     Some(&mut seen_cli_pipes),
                                     client_input_mode,
                                     Some(os_input.clone()),
+                                    is_cli_client,
                                 ) {
                                     Ok(route_action_should_break) => {
                                         if route_action_should_break.0 {
@@ -2615,12 +3331,16 @@ pub(crate) fn route_thread_main(
                             )
                             .with_context(err_context)?;
                         },
-                        ClientToServerMsg::KittyGraphicsSupport { supported } => {
+                        ClientToServerMsg::KittyGraphicsSupport {
+                            supported,
+                            local_media,
+                        } => {
                             send_to_screen_or_retry_queue!(
                                 senders,
                                 ScreenInstruction::SetKittyGraphicsSupport {
                                     client_id,
-                                    supported
+                                    supported,
+                                    local_media
                                 },
                                 instruction,
                                 retry_queue
@@ -2650,6 +3370,51 @@ pub(crate) fn route_thread_main(
                                 retry_queue
                             )
                             .with_context(err_context)?;
+                        },
+                        ClientToServerMsg::StructuredRenderSupport { supported } => {
+                            send_to_screen_or_retry_queue!(
+                                senders,
+                                ScreenInstruction::SetStructuredRenderSupport {
+                                    client_id,
+                                    supported
+                                },
+                                instruction,
+                                retry_queue
+                            )
+                            .with_context(err_context)?;
+                        },
+                        ClientToServerMsg::ClipboardPasteSupport {
+                            supported,
+                            ref shortcut,
+                        } => {
+                            send_to_screen_or_retry_queue!(
+                                senders,
+                                ScreenInstruction::SetClipboardPasteSupport {
+                                    client_id,
+                                    supported,
+                                    shortcut: shortcut.clone()
+                                },
+                                instruction,
+                                retry_queue
+                            )
+                            .with_context(err_context)?;
+                        },
+                        ClientToServerMsg::RenderFrameAck { seq } => {
+                            send_to_screen_priority_or_retry_queue!(
+                                senders,
+                                ScreenInstruction::RenderFrameAck { client_id, seq },
+                                instruction,
+                                retry_queue
+                            )
+                            .with_context(err_context)?;
+                        },
+                        ClientToServerMsg::FontFamilies { families } => {
+                            let _ = to_server
+                                .send(ServerInstruction::FontFamilies(client_id, families));
+                        },
+                        ClientToServerMsg::AdoptSessionHistory { history } => {
+                            let _ = to_server
+                                .send(ServerInstruction::AdoptSessionHistory(client_id, history));
                         },
                         ClientToServerMsg::BackgroundColor {
                             color: ref background_color_instruction,
@@ -2712,6 +3477,7 @@ pub(crate) fn route_thread_main(
                             pane_to_focus: pane_id_to_focus,
                             is_web_client,
                         } => {
+                            wait_for_session_to_be_ready(&session_data);
                             let allow_web_connections = session_data
                                 .read()
                                 .ok()
@@ -2785,6 +3551,14 @@ pub(crate) fn route_thread_main(
                                 .with_context(err_context)?;
                         },
                         ClientToServerMsg::ConnStatus => {
+                            let _ = to_server.send(ServerInstruction::ConnStatus(client_id));
+                            should_break = true;
+                        },
+                        ClientToServerMsg::DetachSession { client_ids } if client_ids.is_empty() => {
+                            let _ = to_server.send(ServerInstruction::DisconnectAllClientsExcept(
+                                client_id,
+                                ExitReason::NormalDetached,
+                            ));
                             let _ = to_server.send(ServerInstruction::ConnStatus(client_id));
                             should_break = true;
                         },
@@ -2944,6 +3718,22 @@ pub(crate) fn route_thread_main(
                                 },
                             }
                         },
+                        ClientToServerMsg::RequestSessionPreview {
+                            tab_index,
+                            pane_id,
+                            anchor,
+                        } => {
+                            let preview = crate::session_previews::answer_preview_request(
+                                senders.as_ref(),
+                                tab_index,
+                                pane_id,
+                                anchor,
+                            );
+                            let _ = os_input.send_to_client(
+                                client_id,
+                                ServerToClientMsg::SessionPreview { preview },
+                            );
+                        },
                         ClientToServerMsg::RequestSessionList => {
                             if let Some(senders) = senders.as_ref() {
                                 if let Some(scan_state) =
@@ -2971,10 +3761,46 @@ pub(crate) fn route_thread_main(
                                         ScreenInstruction::UpdateSessionInfos(
                                             live_sessions_map,
                                             resurrectable_sessions_map,
+                                            None,
                                         ),
                                     );
                                 }
                             }
+                        },
+                        ClientToServerMsg::RequestSessionAttention {
+                            include_command_text,
+                        } => {
+                            let attention = senders
+                                .as_ref()
+                                .map(|senders| {
+                                    crate::session_link::local_session_attention(
+                                        senders,
+                                        include_command_text,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            let _ = os_input.send_to_client(
+                                client_id,
+                                ServerToClientMsg::SessionAttention { attention },
+                            );
+                        },
+                        ClientToServerMsg::PeerAttentionChanged {
+                            session_name,
+                            attention,
+                        } => {
+                            if let Some(senders) = senders.as_ref() {
+                                let _ = senders.send_to_background_jobs(
+                                    crate::background_jobs::BackgroundJob::PeerAttention(
+                                        crate::attention::peers::PeerAttentionJob::PeerChanged {
+                                            session_name,
+                                            attention,
+                                        },
+                                    ),
+                                );
+                            }
+                        },
+                        ClientToServerMsg::PaneMirror { .. } => {
+                            log::warn!("Ignoring a pane mirror message on a client connection");
                         },
                         ClientToServerMsg::SetMobileRenderPreferences { single_pane, fit } => {
                             let _ = send_to_screen_or_retry_queue!(
@@ -3518,9 +4344,128 @@ fn send_output_to_client(
     }
 }
 
+fn type_into_popup(senders: &ThreadSenders, client_id: ClientId, chars: &str) {
+    for ch in chars.chars() {
+        let key = zellij_utils::data::KeyWithModifier::new(BareKey::Char(ch));
+        let bytes = ch.to_string().into_bytes();
+        let _ = senders.send_to_plugin(PluginInstruction::UserInput {
+            client_id,
+            action: Action::Write {
+                key_with_modifier: Some(key.clone()),
+                bytes: bytes.clone(),
+                is_kitty_keyboard_protocol: false,
+            },
+            terminal_id: None,
+            cli_client_id: None,
+        });
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let _ = senders.send_to_screen(ScreenInstruction::KeyToPopup(
+            key,
+            bytes,
+            false,
+            client_id,
+            Some(NotificationEnd::new(completion_tx)),
+        ));
+        let _ = wait_for_action_completion(completion_rx, "KeyToPopup", false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_key(bare_key: BareKey, modifiers: &[KeyModifier], bytes: Vec<u8>) -> Action {
+        let key = zellij_utils::data::KeyWithModifier::new_with_modifiers(
+            bare_key,
+            modifiers.iter().copied().collect(),
+        );
+        Action::Write {
+            key_with_modifier: Some(key),
+            bytes,
+            is_kitty_keyboard_protocol: false,
+        }
+    }
+
+    #[test]
+    fn a_bare_escape_is_recognised() {
+        assert!(action_presses_escape(&write_key(
+            BareKey::Esc,
+            &[],
+            vec![0x1b]
+        )));
+        assert!(action_presses_escape(&Action::Write {
+            key_with_modifier: None,
+            bytes: vec![0x1b],
+            is_kitty_keyboard_protocol: false,
+        }));
+    }
+
+    #[test]
+    fn escape_sequences_and_modified_escapes_are_not_a_bare_escape() {
+        assert!(!action_presses_escape(&write_key(
+            BareKey::Esc,
+            &[KeyModifier::Alt],
+            vec![0x1b, 0x1b]
+        )));
+        assert!(!action_presses_escape(&Action::Write {
+            key_with_modifier: None,
+            bytes: vec![0x1b, b'[', b'A'],
+            is_kitty_keyboard_protocol: false,
+        }));
+        assert!(!action_presses_escape(&write_key(
+            BareKey::Enter,
+            &[],
+            vec![b'\r']
+        )));
+        assert!(!action_presses_escape(&Action::WriteChars {
+            chars: "\u{1b}".to_owned()
+        }));
+    }
+
+    #[test]
+    fn enter_and_newlines_count_as_submitting_input() {
+        assert!(action_submits_input(&write_key(
+            BareKey::Enter,
+            &[],
+            vec![b'\r']
+        )));
+        assert!(action_submits_input(&Action::Write {
+            key_with_modifier: None,
+            bytes: b"ls\r".to_vec(),
+            is_kitty_keyboard_protocol: false,
+        }));
+        assert!(action_submits_input(&Action::Write {
+            key_with_modifier: None,
+            bytes: b"\n".to_vec(),
+            is_kitty_keyboard_protocol: false,
+        }));
+        assert!(action_submits_input(&Action::WriteChars {
+            chars: "ls\n".to_owned()
+        }));
+    }
+
+    #[test]
+    fn other_input_does_not_count_as_submitting_input() {
+        assert!(!action_submits_input(&write_key(
+            BareKey::Char('a'),
+            &[],
+            vec![b'a']
+        )));
+        assert!(!action_submits_input(&write_key(
+            BareKey::Esc,
+            &[],
+            vec![0x1b]
+        )));
+        assert!(!action_submits_input(&write_key(
+            BareKey::Enter,
+            &[KeyModifier::Shift],
+            b"\x1b[13;2u".to_vec()
+        )));
+        assert!(!action_submits_input(&Action::WriteChars {
+            chars: "ls".to_owned()
+        }));
+        assert!(!action_submits_input(&Action::Quit));
+    }
 
     #[test]
     fn test_notification_end_sets_affected_tab_id() {
