@@ -28,7 +28,7 @@ use std::cmp::Ordering;
 use std::fmt::{Display, Formatter};
 use std::str::FromStr;
 
-use super::plugins::{PluginAliases, PluginTag, PluginsConfigError};
+use super::plugins::{canonical_run_plugin, PluginAliases, PluginTag, PluginsConfigError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::vec::Vec;
@@ -124,9 +124,6 @@ impl RunPluginOrAlias {
     }
     pub fn populate_run_plugin_if_needed(&mut self, plugin_aliases: &PluginAliases) {
         if let RunPluginOrAlias::Alias(run_plugin_alias) = self {
-            if run_plugin_alias.run_plugin.is_some() {
-                log::warn!("Overriding plugin alias");
-            }
             let merged_run_plugin = plugin_aliases
                 .aliases
                 .get(run_plugin_alias.name.as_str())
@@ -144,6 +141,11 @@ impl RunPluginOrAlias {
                     }
                     merged_run_plugin
                 });
+            if run_plugin_alias.run_plugin.is_some()
+                && run_plugin_alias.run_plugin != merged_run_plugin
+            {
+                log::warn!("Overriding plugin alias");
+            }
             run_plugin_alias.run_plugin = merged_run_plugin;
         }
     }
@@ -198,23 +200,8 @@ impl RunPluginOrAlias {
                 Some(Run::Plugin(RunPluginOrAlias::Alias(run_alias))),
             ) => {
                 self_alias.name == run_alias.name
-                    && self_alias
-                        .configuration
-                        .as_ref()
-                        // we do the is_empty() checks because an empty configuration is the same as no
-                        // configuration (i.e. None)
-                        .and_then(|c| if c.inner().is_empty() { None } else { Some(c) })
-                        == run_alias.configuration.as_ref().and_then(|c| {
-                            let mut to_compare = c.inner().clone();
-                            // caller_cwd is a special attribute given to alias and should not be
-                            // considered when weighing configuration equivalency
-                            to_compare.remove("caller_cwd");
-                            if to_compare.is_empty() {
-                                None
-                            } else {
-                                Some(c)
-                            }
-                        })
+                    && self_alias.configuration_without_caller_cwd()
+                        == run_alias.configuration_without_caller_cwd()
             },
             (
                 RunPluginOrAlias::Alias(self_alias),
@@ -413,6 +400,48 @@ impl Run {
             _ => None,
         }
     }
+    pub fn bar_names(&self) -> Vec<String> {
+        let mut names = vec![];
+        let Run::Plugin(run_plugin_or_alias) = self else {
+            return names;
+        };
+        if let RunPluginOrAlias::Alias(alias) = run_plugin_or_alias {
+            names.push(alias.name.clone());
+        }
+        if let Some(run_plugin) = self.get_run_plugin() {
+            let canonical = canonical_run_plugin(&run_plugin);
+            if canonical.location
+                == RunPluginLocation::Zellij(PluginTag::new(super::plugins::BARS_PLUGIN_NAME))
+            {
+                let role = canonical
+                    .configuration
+                    .inner()
+                    .get("role")
+                    .cloned()
+                    .unwrap_or_else(|| crate::data::TAB_BAR.to_owned());
+                names.push(role);
+            }
+            names.push(run_plugin.location.display());
+        }
+        names.dedup();
+        names
+    }
+    pub fn fills_same_layout_slot(this: &Option<Run>, other: &Option<Run>) -> bool {
+        if this == other {
+            return true;
+        }
+        match (this, other) {
+            (Some(this @ Run::Plugin(_)), Some(other @ Run::Plugin(_))) => {
+                match (this.get_run_plugin(), other.get_run_plugin()) {
+                    (Some(this), Some(other)) => {
+                        canonical_run_plugin(&this) == canonical_run_plugin(&other)
+                    },
+                    _ => false,
+                }
+            },
+            _ => false,
+        }
+    }
     pub fn populate_run_plugin_if_needed(&mut self, alias_dict: &PluginAliases) {
         match self {
             Run::Plugin(run_plugin_alias) => {
@@ -494,6 +523,17 @@ impl PluginAlias {
             initial_cwd,
             ..Default::default()
         }
+    }
+    fn configuration_without_caller_cwd(&self) -> Option<BTreeMap<String, String>> {
+        self.configuration.as_ref().and_then(|configuration| {
+            let mut configuration = configuration.inner().clone();
+            configuration.remove("caller_cwd");
+            if configuration.is_empty() {
+                None
+            } else {
+                Some(configuration)
+            }
+        })
     }
     pub fn set_caller_cwd_if_not_set(&mut self, caller_cwd: Option<PathBuf>) {
         // we do this only for an alias because in all other cases this will be handled by the
@@ -695,7 +735,7 @@ pub type SwapFloatingLayout = (
     Option<String>,
 ); // Option<String> is the swap layout name
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Layout {
     pub tabs: Vec<(Option<String>, TiledPaneLayout, Vec<FloatingPaneLayout>)>,
     pub focused_tab_index: Option<usize>,
@@ -703,6 +743,25 @@ pub struct Layout {
     pub swap_layouts: Vec<(TiledPaneLayout, Vec<FloatingPaneLayout>)>,
     pub swap_tiled_layouts: Vec<SwapTiledLayout>,
     pub swap_floating_layouts: Vec<SwapFloatingLayout>,
+    #[serde(default)]
+    pub session_attention_muted: bool,
+}
+
+impl std::fmt::Debug for Layout {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let mut debug_struct = f.debug_struct("Layout");
+        debug_struct
+            .field("tabs", &self.tabs)
+            .field("focused_tab_index", &self.focused_tab_index)
+            .field("template", &self.template)
+            .field("swap_layouts", &self.swap_layouts)
+            .field("swap_tiled_layouts", &self.swap_tiled_layouts)
+            .field("swap_floating_layouts", &self.swap_floating_layouts);
+        if self.session_attention_muted {
+            debug_struct.field("session_attention_muted", &self.session_attention_muted);
+        }
+        debug_struct.finish()
+    }
 }
 
 /// Layout configuration for a single tab in multi-tab override
@@ -801,6 +860,10 @@ pub struct FloatingPaneLayout {
     pub logical_position: Option<usize>,
     pub default_fg: Option<String>,
     pub default_bg: Option<String>,
+    #[serde(default)]
+    pub attention_muted: Option<bool>,
+    #[serde(default)]
+    pub ignore_output: Option<bool>,
 }
 
 impl FloatingPaneLayout {
@@ -821,6 +884,8 @@ impl FloatingPaneLayout {
             logical_position: None,
             default_fg: None,
             default_bg: None,
+            attention_muted: None,
+            ignore_output: None,
         }
     }
     pub fn add_cwd_to_layout(&mut self, cwd: &PathBuf) {
@@ -845,6 +910,8 @@ impl From<&TiledPaneLayout> for FloatingPaneLayout {
             run: pane_layout.run.clone(),
             focus: pane_layout.focus,
             border_style: pane_layout.border_style,
+            attention_muted: pane_layout.attention_muted,
+            ignore_output: pane_layout.ignore_output,
             ..Default::default()
         }
     }
@@ -870,6 +937,10 @@ pub struct TiledPaneLayout {
     pub pane_initial_contents: Option<String>,
     pub default_fg: Option<String>,
     pub default_bg: Option<String>,
+    #[serde(default)]
+    pub attention_muted: Option<bool>,
+    #[serde(default)]
+    pub ignore_output: Option<bool>,
 }
 
 impl TiledPaneLayout {
@@ -1415,7 +1486,7 @@ impl Layout {
                 .next()
                 .map(|l| l.recursively_add_start_suspended_including_template(Some(true)));
         }
-        let config = Config::from_kdl(&raw_layout, config)?; // this merges the two config, with
+        let config = Config::from_layout_kdl(&raw_layout, config)?; // this merges the two config, with
         layout.map(|l| (l, config))
     }
     pub fn stringified_from_path_or_default(
@@ -1481,7 +1552,7 @@ impl Layout {
                 .map(|(r, f)| (r.as_str(), f.as_str())),
             None,
         )?;
-        let config = Config::from_kdl(&raw_layout, Some(config))?; // this merges the two config, with
+        let config = Config::from_layout_kdl(&raw_layout, Some(config))?; // this merges the two config, with
         Ok((layout, config))
     }
     #[cfg(not(target_family = "wasm"))]
@@ -1490,7 +1561,7 @@ impl Layout {
             .map_err(|e| ConfigError::DownloadError(format!("{}", e)))?;
         let mut layout = Layout::from_kdl(&raw_layout, Some(url.into()), None, None)?;
         layout.recursively_add_start_suspended_including_template(Some(true));
-        let config = Config::from_kdl(&raw_layout, Some(config))?; // this merges the two config, with
+        let config = Config::from_layout_kdl(&raw_layout, Some(config))?; // this merges the two config, with
         Ok((layout, config))
     }
     pub fn from_stringified_layout(
@@ -1498,7 +1569,7 @@ impl Layout {
         config: Config,
     ) -> Result<(Layout, Config), ConfigError> {
         let layout = Layout::from_kdl(&stringified_layout, None, None, None)?;
-        let config = Config::from_kdl(&stringified_layout, Some(config))?; // this merges the two config, with
+        let config = Config::from_layout_kdl(&stringified_layout, Some(config))?; // this merges the two config, with
         Ok((layout, config))
     }
     #[cfg(target_family = "wasm")]
@@ -1538,7 +1609,7 @@ impl Layout {
                 .map(|(r, f)| (r.as_str(), f.as_str())),
             None,
         )?;
-        let config = Config::from_kdl(&raw_layout, Some(config))?; // this merges the two config, with
+        let config = Config::from_layout_kdl(&raw_layout, Some(config))?; // this merges the two config, with
         Ok((layout, config))
     }
     pub fn default_layout_asset() -> Layout {
@@ -1780,6 +1851,23 @@ impl Layout {
             Err(_e) => None,
         }
     }
+    pub fn populate_plugin_aliases_in_swap_layouts(&mut self, plugin_aliases: &PluginAliases) {
+        for swap_tiled_layout in &mut self.swap_tiled_layouts {
+            for (_constraint, tiled_pane_layout) in &mut swap_tiled_layout.0 {
+                tiled_pane_layout.populate_plugin_aliases_in_layout(plugin_aliases);
+            }
+        }
+        for swap_floating_layout in &mut self.swap_floating_layouts {
+            for (_constraint, floating_pane_layouts) in &mut swap_floating_layout.0 {
+                for floating_pane_layout in floating_pane_layouts {
+                    floating_pane_layout
+                        .run
+                        .as_mut()
+                        .map(|f| f.populate_run_plugin_if_needed(plugin_aliases));
+                }
+            }
+        }
+    }
     pub fn populate_plugin_aliases_in_layout(&mut self, plugin_aliases: &PluginAliases) {
         for tab in self.tabs.iter_mut() {
             tab.1.populate_plugin_aliases_in_layout(plugin_aliases);
@@ -1799,21 +1887,7 @@ impl Layout {
                     .map(|f| f.populate_run_plugin_if_needed(&plugin_aliases));
             }
         }
-        for swap_tiled_layout in &mut self.swap_tiled_layouts {
-            for (_constraint, tiled_pane_layout) in &mut swap_tiled_layout.0 {
-                tiled_pane_layout.populate_plugin_aliases_in_layout(plugin_aliases);
-            }
-        }
-        for swap_floating_layout in &mut self.swap_floating_layouts {
-            for (_constraint, floating_pane_layouts) in &mut swap_floating_layout.0 {
-                for floating_pane_layout in floating_pane_layouts {
-                    floating_pane_layout
-                        .run
-                        .as_mut()
-                        .map(|f| f.populate_run_plugin_if_needed(plugin_aliases));
-                }
-            }
-        }
+        self.populate_plugin_aliases_in_swap_layouts(plugin_aliases);
     }
     pub fn add_cwd_to_layout(&mut self, cwd: &PathBuf) {
         for (_, tiled_pane_layout, floating_panes) in self.tabs.iter_mut() {

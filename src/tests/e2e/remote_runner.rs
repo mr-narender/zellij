@@ -63,6 +63,11 @@ fn stop_zellij(channel: &mut ssh2::Channel) {
     channel
         .write_all(b"rm -rf ~/.cache/zellij/permissions.kdl\n")
         .unwrap();
+    channel
+        .write_all(
+            b"mkdir -p ~/.local/share/zellij && echo '{\"flags\":[\"SetupNeverShow\"]}' > ~/.local/share/zellij/desktop_integration.json\n",
+        )
+        .unwrap();
     // create an arch-independent symlink so the binary path in snapshots is stable across
     // x86_64 (CI) and aarch64 (Apple Silicon local dev)
     channel
@@ -91,7 +96,7 @@ fn start_zellij_mirrored_session_with_layout(channel: &mut ssh2::Channel, layout
     channel
         .write_all(
             format!(
-                "{} {} --session {} --data-dir {} --new-session-with-layout {} options --show-release-notes false --show-startup-tips false --mirror-session true --serialization-interval 1\n",
+                "{} {} --session {} --data-dir {} --new-session-with-layout {} options --show-release-notes false --show-startup-tips false --mirror-session true --serialization-interval 1 --on-quit quit\n",
                 SET_ENV_VARIABLES,
                 ZELLIJ_EXECUTABLE_LOCATION,
                 SESSION_NAME,
@@ -298,6 +303,12 @@ impl RemoteTerminal {
     }
     pub fn tab_bar_appears(&self) -> bool {
         self.last_snapshot.lock().unwrap().contains("Tab #1")
+    }
+    pub fn session_indicator_appears(&self) -> bool {
+        self.last_snapshot
+            .lock()
+            .unwrap()
+            .contains("[ 1 running ▾ ]")
     }
     pub fn snapshot_contains(&self, text: &str) -> bool {
         self.last_snapshot.lock().unwrap().contains(text)

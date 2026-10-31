@@ -2,7 +2,7 @@
 use crate::{
     data::{ClientId, ConnectToSession, HostTerminalThemeMode, KeyWithModifier, PaneId, Style},
     errors::{prelude::*, ErrorContext},
-    input::{actions::Action, cli_assets::CliAssets},
+    input::{actions::Action, cli_assets::CliAssets, terminal::TerminalSettings},
     pane_size::{Size, SizeInPixels},
 };
 use interprocess::local_socket::Stream as LocalSocketStream;
@@ -21,6 +21,7 @@ use crate::client_server_contract::client_server_contract::{
 };
 use prost::Message;
 
+mod attention_conversion;
 mod enum_conversions;
 mod protobuf_conversion;
 
@@ -138,14 +139,14 @@ pub struct MobileSessionPayload {
     pub creation_secs_ago: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct MobileRenderPrefsPayload {
     pub single_pane: bool,
     pub fit: bool,
     pub active_pane_is_fullscreen: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 pub struct MobileStatePayload {
     pub session_name: String,
     pub now_secs: u64,
@@ -238,6 +239,7 @@ pub enum ClientToServerMsg {
     },
     KittyGraphicsSupport {
         supported: bool,
+        local_media: bool,
     },
     KittyZlibSupport {
         supported: bool,
@@ -246,12 +248,43 @@ pub enum ClientToServerMsg {
         supported: bool,
     },
     RequestSessionList,
+    RequestSessionPreview {
+        tab_index: Option<u32>,
+        pane_id: Option<(u32, bool)>,
+        anchor: Option<crate::data::PreviewAnchor>,
+    },
+    RequestSessionAttention {
+        include_command_text: bool,
+    },
+    PeerAttentionChanged {
+        session_name: String,
+        attention: Option<crate::attention::SessionAttention>,
+    },
     SetMobileRenderPreferences {
         single_pane: bool,
         fit: bool,
     },
     HostTerminalFocusChanged {
         focused: bool,
+    },
+    StructuredRenderSupport {
+        supported: bool,
+    },
+    ClipboardPasteSupport {
+        supported: bool,
+        shortcut: Option<String>,
+    },
+    RenderFrameAck {
+        seq: u64,
+    },
+    FontFamilies {
+        families: Vec<String>,
+    },
+    PaneMirror {
+        payload: Vec<u8>,
+    },
+    AdoptSessionHistory {
+        history: crate::session_history::SessionHistory,
     },
 }
 
@@ -260,6 +293,9 @@ pub enum ClientToServerMsg {
 pub enum ServerToClientMsg {
     Render {
         content: String,
+    },
+    RenderFrame {
+        frame: Vec<u8>,
     },
     UnblockInputThread,
     Exit {
@@ -277,6 +313,7 @@ pub enum ServerToClientMsg {
     },
     UnblockCliPipeInput {
         pipe_name: String,
+        exit_code: Option<i32>,
     },
     CliPipeOutput {
         pipe_name: String,
@@ -286,11 +323,20 @@ pub enum ServerToClientMsg {
     SetSoftKeyboard {
         on: bool,
     },
+    PasteFromClipboard {
+        pane_id: Option<PaneId>,
+    },
     StartWebServer,
     RenamedSession {
         name: String,
     },
     ConfigFileUpdated,
+    TerminalSettingsChanged {
+        settings: Box<TerminalSettings>,
+    },
+    HostTerminalThemeChanged {
+        mode: HostTerminalThemeMode,
+    },
     PaneRenderUpdate {
         pane_id: PaneId,
         viewport: Vec<String>,
@@ -310,6 +356,18 @@ pub enum ServerToClientMsg {
     },
     MobileState {
         payload: MobileStatePayload,
+    },
+    HostProgramStatus {
+        status: Option<crate::attention::HostProgramStatus>,
+    },
+    SessionAttention {
+        attention: crate::attention::SessionAttention,
+    },
+    SessionPreview {
+        preview: Option<crate::data::SessionPreview>,
+    },
+    PaneMirror {
+        payload: Vec<u8>,
     },
 }
 

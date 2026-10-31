@@ -1,14 +1,16 @@
+use crate::status_bar::unstyled_len;
 use ansi_term::{
-    unstyled_len, ANSIString, ANSIStrings,
+    ANSIString, ANSIStrings,
     Color::{Fixed, RGB},
     Style,
 };
+use zellij_tile::graphemes::display_width;
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 use zellij_tile_utils::palette_match;
 
 use crate::status_bar::{
-    action_key, action_key_group, style_key_with_modifier,
+    action_key, action_key_group, bars_hint, style_key_with_modifier,
     tip::{data::TIPS, TipFn},
     LinePart, MORE_MSG, TO_NORMAL,
 };
@@ -39,17 +41,19 @@ fn full_length_shortcut(
     LinePart {
         part: part.to_string(),
         len: unstyled_len(&part),
+        ..Default::default()
     }
 }
 
 fn locked_interface_indication(palette: Styling) -> LinePart {
     let locked_text = " -- INTERFACE LOCKED -- ";
-    let locked_text_len = locked_text.chars().count();
+    let locked_text_len = display_width(&locked_text);
     let text_color = palette_match!(palette.text_unselected.base);
     let locked_styled_text = Style::new().fg(text_color).bold().paint(locked_text);
     LinePart {
         part: locked_styled_text.to_string(),
         len: locked_text_len,
+        ..Default::default()
     }
 }
 
@@ -124,6 +128,10 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
         (s("Toggle Floating"), s("Floating"),
             action_key(&km, &[A::ToggleFloatingPanes, TO_NORMAL])),
         (s("Toggle Embed"), s("Embed"), action_key(&km, &[A::TogglePaneEmbedOrFloating, TO_NORMAL])),
+        (s("Mute"), s("Mute"), action_key(&km, &[A::MutePane, TO_NORMAL])),
+        (s("Ignore output"), s("Ignore"), action_key(&km, &[A::IgnorePaneOutput, TO_NORMAL])),
+        (s("Watch"), s("Watch"), action_key(&km, &[A::WatchPane, TO_NORMAL])),
+        (s(bars_hint(mi).0), s(bars_hint(mi).1), action_key(&km, &[A::ToggleBars{bars: vec![]}, TO_NORMAL])),
         (s("Select pane"), s("Select"), to_normal_key),
     ]} else if mi.mode == IM::Tab {
         let old_keymap = mi.get_mode_keybinds();
@@ -159,6 +167,10 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
             &[Action::BreakPaneRight, TO_NORMAL],
         ])),
         (s("Toggle"), s("Toggle"), action_key(&km, &[A::ToggleTab])),
+        (s("Layout"), s("Layout"), action_key_group(&km, &[
+            &[A::NextSwapLayout],
+            &[A::PreviousSwapLayout],
+        ])),
         (s("Select pane"), s("Select"), to_normal_key),
     ]} else if mi.mode == IM::Resize { vec![
         (s("Increase/Decrease size"), s("Increase/Decrease"),
@@ -217,7 +229,10 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
         (s("Whole words"), s("Whole"),
             action_key(&km, &[A::SearchToggleOption{option: SOpt::WholeWord}])),
     ]} else if mi.mode == IM::Session { vec![
+        (s("Next item"), s("Next"), action_key(&km, &[A::GoToNextAttention, TO_NORMAL])),
         (s("Detach"), s("Detach"), action_key(&km, &[Action::Detach])),
+        (s("Rename"), s("Rename"),
+            action_key(&km, &[A::SwitchToMode{input_mode: IM::RenameSession}, A::SessionNameInput{input: vec![0]}])),
         (s("Session Manager"), s("Manager"), action_key(&km, &[A::LaunchOrFocusPlugin{plugin: Default::default(), should_float: true, move_to_focused_tab: true, should_open_in_place: false, close_replaced_pane: false, skip_cache: false, tab_id: None}, TO_NORMAL])),
         (s("Select pane"), s("Select"), to_normal_key),
     ]} else if mi.mode == IM::Tmux { vec![
@@ -243,7 +258,7 @@ fn get_keys_and_hints(mi: &ModeInfo) -> Vec<(String, String, Vec<KeyWithModifier
         (s("Previous Tab"), s("Previous"), action_key(&km, &[A::GoToPreviousTab, TO_NORMAL])),
         (s("Next Tab"), s("Next"), action_key(&km, &[A::GoToNextTab, TO_NORMAL])),
         (s("Select pane"), s("Select"), to_normal_key),
-    ]} else if matches!(mi.mode, IM::RenamePane | IM::RenameTab) { vec![
+    ]} else if matches!(mi.mode, IM::RenamePane | IM::RenameTab | IM::RenameSession) { vec![
         (s("When done"), s("Done"), to_normal_key),
         (s("Select pane"), s("Select"), action_key_group(&km, &[
             &[A::MoveFocus{direction: Dir::Left}], &[A::MoveFocus{direction: Dir::Down}],
@@ -283,9 +298,9 @@ fn best_effort_shortcut_list_nonstandard_mode(help: &ModeInfo, max_len: usize) -
 
     for (_, short, keys) in keys_and_hints.into_iter() {
         let new_line_part = add_shortcut(help, &line_part, &short, keys.to_vec());
-        if new_line_part.len + MORE_MSG.chars().count() > max_len {
+        if new_line_part.len + display_width(&MORE_MSG) > max_len {
             line_part.part = format!("{}{}", line_part.part, MORE_MSG);
-            line_part.len += MORE_MSG.chars().count();
+            line_part.len += display_width(&MORE_MSG);
             break;
         }
         line_part = new_line_part;
@@ -371,6 +386,7 @@ fn nested_session_status_hint(
         return LinePart {
             part: part.to_string(),
             len,
+            ..Default::default()
         };
     }
     let part = ANSIStrings(&key_bits);
@@ -379,6 +395,7 @@ fn nested_session_status_hint(
         LinePart {
             part: part.to_string(),
             len,
+            ..Default::default()
         }
     } else {
         LinePart::default()
@@ -395,8 +412,9 @@ pub fn text_copied_hint(copy_destination: CopyDestination) -> LinePart {
         CopyDestination::System => "Text copied to system clipboard",
     };
     LinePart {
-        part: serialize_text(&Text::new(&hint).color_range(2, ..).opaque()),
-        len: hint.len(),
+        part: serialize_text(&Text::from(hint).color_range(2, ..).opaque()),
+        len: display_width(hint),
+        ..Default::default()
     }
 }
 
@@ -405,7 +423,8 @@ pub fn system_clipboard_error(palette: &Styling) -> LinePart {
     let red_color = palette_match!(palette.text_unselected.emphasis_3);
     LinePart {
         part: Style::new().fg(red_color).bold().paint(hint).to_string(),
-        len: hint.len(),
+        len: display_width(hint),
+        ..Default::default()
     }
 }
 
@@ -419,10 +438,10 @@ pub fn fullscreen_panes_to_hide(palette: &Styling, panes_to_hide: usize) -> Line
     let puls = "+ ";
     let panes = panes_to_hide.to_string();
     let hide = " hidden panes";
-    let len = fullscreen.chars().count()
-        + puls.chars().count()
-        + panes.chars().count()
-        + hide.chars().count()
+    let len = display_width(&fullscreen)
+        + display_width(&puls)
+        + display_width(&panes)
+        + display_width(&hide)
         + 5;
     LinePart {
         part: format!(
@@ -435,6 +454,7 @@ pub fn fullscreen_panes_to_hide(palette: &Styling, panes_to_hide: usize) -> Line
             Style::new().fg(text_color).bold().paint(hide)
         ),
         len,
+        ..Default::default()
     }
 }
 
@@ -473,14 +493,14 @@ pub fn floating_panes_are_visible(mode_info: &ModeInfo) -> LinePart {
     let p_right_separator = "> ";
     let to_hide = "to hide.";
 
-    let len = floating_panes.chars().count()
-        + press.chars().count()
-        + pane_mode.chars().count()
-        + plus.chars().count()
-        + p_left_separator.chars().count()
-        + p.chars().count()
-        + p_right_separator.chars().count()
-        + to_hide.chars().count()
+    let len = display_width(&floating_panes)
+        + display_width(&press)
+        + display_width(&pane_mode)
+        + display_width(&plus)
+        + display_width(&p_left_separator)
+        + display_width(&p)
+        + display_width(&p_right_separator)
+        + display_width(&to_hide)
         + 5;
     LinePart {
         part: format!(
@@ -497,6 +517,7 @@ pub fn floating_panes_are_visible(mode_info: &ModeInfo) -> LinePart {
             Style::new().fg(white_color).bold().paint(to_hide),
         ),
         len,
+        ..Default::default()
     }
 }
 
@@ -511,11 +532,11 @@ pub fn locked_fullscreen_panes_to_hide(palette: &Styling, panes_to_hide: usize) 
     let puls = "+ ";
     let panes = panes_to_hide.to_string();
     let hide = " hidden panes";
-    let len = locked_text.chars().count()
-        + fullscreen.chars().count()
-        + puls.chars().count()
-        + panes.chars().count()
-        + hide.chars().count()
+    let len = display_width(&locked_text)
+        + display_width(&fullscreen)
+        + display_width(&puls)
+        + display_width(&panes)
+        + display_width(&hide)
         + 5;
     LinePart {
         part: format!(
@@ -529,6 +550,7 @@ pub fn locked_fullscreen_panes_to_hide(palette: &Styling, panes_to_hide: usize) 
             Style::new().fg(text_color).bold().paint(hide)
         ),
         len,
+        ..Default::default()
     }
 }
 
@@ -540,7 +562,7 @@ pub fn locked_floating_panes_are_visible(palette: &Styling) -> LinePart {
     let locked_text = " -- INTERFACE LOCKED -- ";
     let floating_panes = "FLOATING PANES VISIBLE";
 
-    let len = locked_text.chars().count() + floating_panes.chars().count();
+    let len = display_width(&locked_text) + display_width(&floating_panes);
     LinePart {
         part: format!(
             "{}{}{}{}",
@@ -550,6 +572,7 @@ pub fn locked_floating_panes_are_visible(palette: &Styling) -> LinePart {
             shortcut_right_separator,
         ),
         len,
+        ..Default::default()
     }
 }
 

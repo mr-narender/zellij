@@ -70,6 +70,13 @@ pub fn initial_panes_from_cli(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ResurrectCommand {
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub cwd: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ResizeDirection {
     Left,
     Right,
@@ -396,6 +403,10 @@ pub enum Action {
         input: Vec<u8>,
     },
     UndoRenameTab,
+    SessionNameInput {
+        input: Vec<u8>,
+    },
+    UndoRenameSession,
     MoveTab {
         direction: Direction,
     },
@@ -405,11 +416,18 @@ pub enum Action {
         near_current_pane: bool,
         no_focus: bool,
     },
+    RunInBackground {
+        command: RunCommandAction,
+    },
     /// Set pane default foreground/background color
     SetPaneColor {
         pane_id: PaneId,
         fg: Option<String>,
         bg: Option<String>,
+    },
+    SetResurrectCommand {
+        pane_id: PaneId,
+        resurrect: Option<ResurrectCommand>,
     },
     /// Detach session and exit
     Detach,
@@ -426,6 +444,7 @@ pub enum Action {
         pane_id: Option<(u32, bool)>, // (id, is_plugin)
         layout: Option<LayoutInfo>,
         cwd: Option<PathBuf>,
+        close_current: bool,
     },
     /// Returns: Plugin pane ID (format: plugin_<id>) when creating or focusing plugin
     LaunchOrFocusPlugin {
@@ -582,6 +601,13 @@ pub enum Action {
         in_place: Option<bool>,
         cwd: Option<PathBuf>,
         pane_title: Option<String>,
+        popup: Option<crate::data::PipePopupPlacement>,
+        #[serde(default)]
+        popup_no_focus: bool,
+        #[serde(default)]
+        popup_capture_all_keys: bool,
+        #[serde(default)]
+        popup_outside_click: Option<crate::data::OutsideClick>,
     },
     KeybindPipe {
         name: Option<String>,
@@ -618,6 +644,7 @@ pub enum Action {
         output_json: bool,
     },
     TogglePanePinned,
+    ToggleMirrorResize,
     StackPanes {
         pane_ids: Vec<PaneId>,
     },
@@ -707,6 +734,12 @@ pub enum Action {
     FocusPaneByPaneId {
         pane_id: PaneId,
     },
+    TogglePaneInGroupByPaneId {
+        pane_id: PaneId,
+    },
+    StartRenamePaneByPaneId {
+        pane_id: PaneId,
+    },
     // Tab-targeting CLI-only variants
     UndoRenameTabByTabId {
         id: u64,
@@ -735,12 +768,81 @@ pub enum Action {
         id: u64,
         direction: Direction,
     },
+    MoveTabToPosition {
+        id: u64,
+        position: u64,
+    },
+    StartRenameTabByTabId {
+        id: u64,
+    },
+    DismissInfoPopups,
+    OpenContextMenu,
+    ToggleSessionCard,
+    MutePane,
+    MutePaneByPaneId {
+        pane_id: PaneId,
+    },
+    IgnorePaneOutput,
+    IgnorePaneOutputByPaneId {
+        pane_id: PaneId,
+    },
+    WatchPane,
+    WatchPaneByPaneId {
+        pane_id: PaneId,
+    },
+    MuteTab,
+    MuteTabByTabId {
+        id: u64,
+    },
+    MuteSession,
+    ToggleSession,
+    GoToPreviousSession,
+    GoToNextSession,
+    GoToNextAttention,
+    ToggleTrayIcon,
+    OpenSessionInTerminal,
+    PasteFromClipboardByPaneId {
+        pane_id: PaneId,
+    },
+    WaitForPaneExit {
+        pane_id: PaneId,
+    },
+    MarkPaneSeen {
+        session: Option<String>,
+        pane_id: Option<PaneId>,
+    },
+    MarkAllSeen {
+        session: Option<String>,
+        this_session: bool,
+    },
+    WriteKeyToPaneId {
+        key_with_modifier: Option<KeyWithModifier>,
+        pane_id: PaneId,
+    },
+    ToggleBars {
+        bars: Vec<String>,
+    },
+    HideBars {
+        bars: Vec<String>,
+    },
+    ShowBars,
+    HideBarByPaneId {
+        pane_id: PaneId,
+    },
 }
 
 impl Default for Action {
     fn default() -> Self {
         Action::NoOp
     }
+}
+
+fn parse_cli_pane_id(pane_id_str: &str) -> Result<PaneId, String> {
+    PaneId::from_str(pane_id_str).map_err(|_| {
+        format!(
+            "Malformed pane id: {pane_id_str}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)"
+        )
+    })
 }
 
 impl Default for SearchDirection {
@@ -764,6 +866,99 @@ impl Action {
             (Action::LaunchPlugin { .. }, Action::LaunchPlugin { .. }) => true,
             (Action::OverrideLayout { .. }, Action::OverrideLayout { .. }) => true,
             _ => self == other_action,
+        }
+    }
+
+    pub fn keybinding_equivalent(&self) -> Vec<Action> {
+        match self {
+            Action::ToggleFocusFullscreenByPaneId { .. } => vec![Action::ToggleFocusFullscreen],
+            Action::ToggleFocusNoUiFullscreenByPaneId { .. } => {
+                vec![Action::ToggleFocusNoUiFullscreen]
+            },
+            Action::TogglePaneEmbedOrFloatingByPaneId { .. } => {
+                vec![Action::TogglePaneEmbedOrFloating]
+            },
+            Action::CloseFocusByPaneId { .. } => vec![Action::CloseFocus],
+            Action::TogglePanePinnedByPaneId { .. } => vec![Action::TogglePanePinned],
+            Action::MutePaneByPaneId { .. } => vec![Action::MutePane],
+            Action::IgnorePaneOutputByPaneId { .. } => vec![Action::IgnorePaneOutput],
+            Action::WatchPaneByPaneId { .. } => vec![Action::WatchPane],
+            Action::MuteTabByTabId { .. } => vec![Action::MuteTab],
+            Action::ShowBars => vec![Action::ToggleBars { bars: vec![] }],
+            Action::HideBars { bars } if bars.is_empty() => {
+                vec![Action::ToggleBars { bars: vec![] }]
+            },
+            Action::TogglePaneInGroupByPaneId { .. } => vec![Action::TogglePaneInGroup],
+            Action::StartRenamePaneByPaneId { .. } => vec![
+                Action::SwitchToMode {
+                    input_mode: InputMode::RenamePane,
+                },
+                Action::PaneNameInput { input: vec![0] },
+            ],
+            Action::UndoRenamePaneByPaneId { .. } => vec![Action::UndoRenamePane],
+            Action::ScrollUpByPaneId { .. } => vec![Action::ScrollUp],
+            Action::ScrollDownByPaneId { .. } => vec![Action::ScrollDown],
+            Action::ScrollToTopByPaneId { .. } => vec![Action::ScrollToTop],
+            Action::ScrollToBottomByPaneId { .. } => vec![Action::ScrollToBottom],
+            Action::PageScrollUpByPaneId { .. } => vec![Action::PageScrollUp],
+            Action::PageScrollDownByPaneId { .. } => vec![Action::PageScrollDown],
+            Action::HalfPageScrollUpByPaneId { .. } => vec![Action::HalfPageScrollUp],
+            Action::HalfPageScrollDownByPaneId { .. } => vec![Action::HalfPageScrollDown],
+            Action::ResizeByPaneId {
+                resize, direction, ..
+            } => vec![Action::Resize {
+                resize: *resize,
+                direction: *direction,
+            }],
+            Action::MovePaneByPaneId { direction, .. } => vec![Action::MovePane {
+                direction: *direction,
+            }],
+            Action::MovePaneBackwardsByPaneId { .. } => vec![Action::MovePaneBackwards],
+            Action::ClearScreenByPaneId { .. } => vec![Action::ClearScreen],
+            Action::EditScrollbackByPaneId { ansi, .. } => {
+                vec![Action::EditScrollback { ansi: *ansi }]
+            },
+            Action::CloseTabById { .. } => vec![Action::CloseTab],
+            Action::MoveTabByTabId { direction, .. } => vec![Action::MoveTab {
+                direction: *direction,
+            }],
+            Action::StartRenameTabByTabId { .. } => vec![
+                Action::SwitchToMode {
+                    input_mode: InputMode::RenameTab,
+                },
+                Action::TabNameInput { input: vec![0] },
+            ],
+            Action::UndoRenameTabByTabId { .. } => vec![Action::UndoRenameTab],
+            Action::ToggleActiveSyncTabByTabId { .. } => vec![Action::ToggleActiveSyncTab],
+            Action::ToggleFloatingPanesByTabId { .. } => vec![Action::ToggleFloatingPanes],
+            Action::PreviousSwapLayoutByTabId { .. } => vec![Action::PreviousSwapLayout],
+            Action::NextSwapLayoutByTabId { .. } => vec![Action::NextSwapLayout],
+            Action::ApplyTiledSwapLayoutByTabId { name, .. } => {
+                vec![Action::ApplyTiledSwapLayout { name: name.clone() }]
+            },
+            Action::ApplyFloatingSwapLayoutByTabId { name, .. } => {
+                vec![Action::ApplyFloatingSwapLayout { name: name.clone() }]
+            },
+            other => vec![other.clone()],
+        }
+    }
+
+    pub fn matches_binding_for_shortcut(&self, binding: &Action) -> bool {
+        match (self, binding) {
+            (
+                Action::LaunchOrFocusPlugin { plugin, .. },
+                Action::LaunchOrFocusPlugin {
+                    plugin: bound_plugin,
+                    ..
+                },
+            ) => plugin.location_string() == bound_plugin.location_string(),
+            (
+                Action::NewPane {
+                    direction: None, ..
+                },
+                Action::NewPane { .. },
+            ) => true,
+            _ => self == binding,
         }
     }
 
@@ -855,17 +1050,15 @@ impl Action {
                         )
                     })?;
 
-                    #[cfg(not(target_family = "wasm"))]
-                    let bytes = key
-                        .serialize_kitty()
-                        .map(|s| s.into_bytes())
-                        .unwrap_or_else(Vec::new);
-
-                    #[cfg(target_family = "wasm")]
-                    let bytes = vec![];
-
                     match &pane_id {
                         Some(pane_id_str) => {
+                            #[cfg(not(target_family = "wasm"))]
+                            let bytes = key
+                                .serialize_non_kitty()
+                                .map(|s| s.into_bytes())
+                                .unwrap_or_else(Vec::new);
+                            #[cfg(target_family = "wasm")]
+                            let bytes = vec![];
                             let parsed_pane_id = PaneId::from_str(pane_id_str)
                                 .map_err(|_| format!(
                                     "Malformed pane id: {}, expecting either a bare integer (eg. 1), a terminal pane id (eg. terminal_1) or a plugin pane id (eg. plugin_1)",
@@ -877,6 +1070,13 @@ impl Action {
                             });
                         },
                         None => {
+                            #[cfg(not(target_family = "wasm"))]
+                            let bytes = key
+                                .serialize_kitty()
+                                .map(|s| s.into_bytes())
+                                .unwrap_or_else(Vec::new);
+                            #[cfg(target_family = "wasm")]
+                            let bytes = vec![];
                             actions.push(Action::Write {
                                 key_with_modifier: Some(key),
                                 bytes,
@@ -1103,6 +1303,9 @@ impl Action {
             },
             CliAction::TogglePaneFrames => Ok(vec![Action::TogglePaneFrames]),
             CliAction::SetPaneFrameStyle { style } => Ok(vec![Action::SetPaneFrameStyle(style)]),
+            CliAction::ToggleBars { bars } => Ok(vec![Action::ToggleBars { bars }]),
+            CliAction::HideBars { bars } => Ok(vec![Action::HideBars { bars }]),
+            CliAction::ShowBars => Ok(vec![Action::ShowBars]),
             CliAction::ToggleActiveSyncTab { tab_id } => match tab_id {
                 Some(id) => Ok(vec![Action::ToggleActiveSyncTabByTabId { id: id as u64 }]),
                 None => Ok(vec![Action::ToggleActiveSyncTab]),
@@ -1119,6 +1322,7 @@ impl Action {
                 name,
                 close_on_exit,
                 start_suspended,
+                notify,
                 configuration,
                 skip_plugin_cache,
                 x,
@@ -1188,6 +1392,7 @@ impl Action {
                             direction,
                             hold_on_close,
                             hold_on_start,
+                            notify,
                             ..Default::default()
                         })
                     } else {
@@ -1304,6 +1509,7 @@ impl Action {
                         direction,
                         hold_on_close,
                         hold_on_start,
+                        notify,
                         ..Default::default()
                     };
                     if floating {
@@ -2004,6 +2210,10 @@ impl Action {
                 in_place_plugin,
                 plugin_cwd,
                 plugin_title,
+                popup,
+                popup_no_focus,
+                popup_capture_all_keys,
+                popup_outside_click,
             } => {
                 let current_dir = get_current_dir();
                 let cwd = plugin_cwd
@@ -2025,6 +2235,10 @@ impl Action {
                     cwd,
                     pane_title: plugin_title,
                     skip_cache,
+                    popup,
+                    popup_no_focus,
+                    popup_capture_all_keys,
+                    popup_outside_click,
                 }])
             },
             CliAction::ListClients => Ok(vec![Action::ListClients]),
@@ -2061,6 +2275,42 @@ impl Action {
             CliAction::CurrentTabInfo { json } => {
                 Ok(vec![Action::CurrentTabInfo { output_json: json }])
             },
+            CliAction::MutePane { pane_id } => match pane_id {
+                Some(pane_id_str) => Ok(vec![Action::MutePaneByPaneId {
+                    pane_id: parse_cli_pane_id(&pane_id_str)?,
+                }]),
+                None => Ok(vec![Action::MutePane]),
+            },
+            CliAction::IgnorePaneOutput { pane_id } => match pane_id {
+                Some(pane_id_str) => Ok(vec![Action::IgnorePaneOutputByPaneId {
+                    pane_id: parse_cli_pane_id(&pane_id_str)?,
+                }]),
+                None => Ok(vec![Action::IgnorePaneOutput]),
+            },
+            CliAction::WatchPane { pane_id } => match pane_id {
+                Some(pane_id_str) => Ok(vec![Action::WatchPaneByPaneId {
+                    pane_id: parse_cli_pane_id(&pane_id_str)?,
+                }]),
+                None => Ok(vec![Action::WatchPane]),
+            },
+            CliAction::MuteTab { tab_id } => match tab_id {
+                Some(id) => Ok(vec![Action::MuteTabByTabId { id }]),
+                None => Ok(vec![Action::MuteTab]),
+            },
+            CliAction::MuteSession => Ok(vec![Action::MuteSession]),
+            CliAction::ToggleSession => Ok(vec![Action::ToggleSession]),
+            CliAction::GoToPreviousSession => Ok(vec![Action::GoToPreviousSession]),
+            CliAction::GoToNextSession => Ok(vec![Action::GoToNextSession]),
+            CliAction::GoToNextAttention => Ok(vec![Action::GoToNextAttention]),
+            CliAction::ToggleTrayIcon => Ok(vec![Action::ToggleTrayIcon]),
+            CliAction::MarkPaneSeen { pane_id } => Ok(vec![Action::MarkPaneSeen {
+                session: None,
+                pane_id: pane_id.as_deref().map(parse_cli_pane_id).transpose()?,
+            }]),
+            CliAction::MarkAllSeen { this_session } => Ok(vec![Action::MarkAllSeen {
+                session: None,
+                this_session,
+            }]),
             CliAction::TogglePanePinned { pane_id } => match pane_id {
                 Some(pane_id_str) => {
                     let pane_id = PaneId::from_str(&pane_id_str)
@@ -2071,6 +2321,7 @@ impl Action {
                 },
                 None => Ok(vec![Action::TogglePanePinned]),
             },
+            CliAction::ToggleMirrorResize => Ok(vec![Action::ToggleMirrorResize]),
             CliAction::StackPanes { pane_ids } => {
                 let mut malformed_ids = vec![];
                 let pane_ids = pane_ids
@@ -2221,10 +2472,55 @@ impl Action {
                     )),
                 }
             },
+            CliAction::SetResurrectCommand {
+                pane_id,
+                cwd,
+                clear,
+                mut command,
+            } => {
+                let pane_id_str = match pane_id {
+                    Some(id) => id,
+                    None => std::env::var("ZELLIJ_PANE_ID").map_err(|_| {
+                        "No --pane-id provided and ZELLIJ_PANE_ID is not set".to_string()
+                    })?,
+                };
+                let parsed_pane_id = PaneId::from_str(&pane_id_str).map_err(|_| {
+                    format!(
+                        "Malformed pane id: {}, expecting either a bare integer (eg. 1) or a terminal pane id (eg. terminal_1)",
+                        pane_id_str
+                    )
+                })?;
+                if matches!(parsed_pane_id, PaneId::Plugin(_)) {
+                    return Err(format!(
+                        "Pane {} is a plugin pane, a resurrect command can only be set for terminal panes",
+                        pane_id_str
+                    ));
+                }
+                let resurrect = if clear {
+                    None
+                } else {
+                    if command.is_empty() {
+                        return Err("A command is required unless --clear is given".to_string());
+                    }
+                    let cwd = cwd.map(|cwd| get_current_dir().join(cwd));
+                    let program = PathBuf::from(command.remove(0));
+                    Some(ResurrectCommand {
+                        command: program,
+                        args: command,
+                        cwd,
+                    })
+                };
+                Ok(vec![Action::SetResurrectCommand {
+                    pane_id: parsed_pane_id,
+                    resurrect,
+                }])
+            },
             CliAction::Detach => Ok(vec![Action::Detach]),
             CliAction::SetDarkTheme => Ok(vec![Action::SetDarkTheme]),
             CliAction::SetLightTheme => Ok(vec![Action::SetLightTheme]),
             CliAction::ToggleTheme => Ok(vec![Action::ToggleTheme]),
+            CliAction::DismissInfoPopups => Ok(vec![Action::DismissInfoPopups]),
+            CliAction::OpenContextMenu => Ok(vec![Action::OpenContextMenu]),
             CliAction::SwitchSession {
                 name,
                 tab_position,
@@ -2233,6 +2529,7 @@ impl Action {
                 layout_string,
                 layout_dir,
                 cwd,
+                close_current,
             } => {
                 let pane_id = match pane_id {
                     Some(stringified_pane_id) => match PaneId::from_str(&stringified_pane_id) {
@@ -2346,6 +2643,7 @@ impl Action {
                     pane_id,
                     layout: layout_info,
                     cwd,
+                    close_current,
                 }])
             },
         }
@@ -2361,7 +2659,7 @@ impl Action {
                     .as_mut()
                     .map(|c| c.populate_originating_plugin(originating_plugin));
             },
-            Action::Run { command, .. } => {
+            Action::Run { command, .. } | Action::RunInBackground { command } => {
                 command.populate_originating_plugin(originating_plugin);
             },
             Action::EditFile { payload, .. } => {
@@ -2426,7 +2724,9 @@ fn suggest_key_fix(key_str: &str) -> String {
 impl From<OnForceClose> for Action {
     fn from(ofc: OnForceClose) -> Action {
         match ofc {
-            OnForceClose::Quit => Action::Quit,
+            OnForceClose::Quit => Action::SkipConfirm {
+                action: Box::new(Action::Quit),
+            },
             OnForceClose::Detach => Action::Detach,
         }
     }
@@ -2438,6 +2738,119 @@ mod tests {
     use crate::data::BareKey;
     use crate::data::KeyModifier;
     use std::path::PathBuf;
+
+    #[test]
+    fn by_id_actions_map_to_their_focused_pane_or_tab_actions() {
+        let pane_id = PaneId::Terminal(3);
+        let pairs = vec![
+            (
+                Action::ToggleFocusFullscreenByPaneId { pane_id },
+                Action::ToggleFocusFullscreen,
+            ),
+            (
+                Action::TogglePaneEmbedOrFloatingByPaneId { pane_id },
+                Action::TogglePaneEmbedOrFloating,
+            ),
+            (Action::CloseFocusByPaneId { pane_id }, Action::CloseFocus),
+            (
+                Action::TogglePanePinnedByPaneId { pane_id },
+                Action::TogglePanePinned,
+            ),
+            (
+                Action::TogglePaneInGroupByPaneId { pane_id },
+                Action::TogglePaneInGroup,
+            ),
+            (
+                Action::ScrollUpByPaneId {
+                    pane_id: PaneId::Terminal(1),
+                },
+                Action::ScrollUp,
+            ),
+            (
+                Action::ResizeByPaneId {
+                    pane_id: PaneId::Terminal(1),
+                    resize: Resize::Increase,
+                    direction: Some(Direction::Left),
+                },
+                Action::Resize {
+                    resize: Resize::Increase,
+                    direction: Some(Direction::Left),
+                },
+            ),
+            (Action::CloseTabById { id: 2 }, Action::CloseTab),
+            (
+                Action::MoveTabByTabId {
+                    id: 2,
+                    direction: Direction::Right,
+                },
+                Action::MoveTab {
+                    direction: Direction::Right,
+                },
+            ),
+            (
+                Action::NextSwapLayoutByTabId { id: 1 },
+                Action::NextSwapLayout,
+            ),
+        ];
+        for (by_id, focused) in pairs {
+            assert_eq!(by_id.keybinding_equivalent(), vec![focused], "{:?}", by_id);
+        }
+    }
+
+    #[test]
+    fn rename_actions_map_to_their_key_sequences() {
+        assert_eq!(
+            Action::StartRenamePaneByPaneId {
+                pane_id: PaneId::Terminal(1)
+            }
+            .keybinding_equivalent(),
+            vec![
+                Action::SwitchToMode {
+                    input_mode: InputMode::RenamePane
+                },
+                Action::PaneNameInput { input: vec![0] },
+            ]
+        );
+        assert_eq!(
+            Action::StartRenameTabByTabId { id: 1 }.keybinding_equivalent(),
+            vec![
+                Action::SwitchToMode {
+                    input_mode: InputMode::RenameTab
+                },
+                Action::TabNameInput { input: vec![0] },
+            ]
+        );
+    }
+
+    #[test]
+    fn other_actions_map_to_themselves() {
+        assert_eq!(Action::Detach.keybinding_equivalent(), vec![Action::Detach]);
+    }
+
+    #[test]
+    fn shortcut_matching_compares_plugins_by_location_and_new_pane_without_direction() {
+        let launch = |name: &str, should_float: bool| Action::LaunchOrFocusPlugin {
+            plugin: RunPluginOrAlias::Alias(PluginAlias::new(name, &None, None)),
+            should_float,
+            move_to_focused_tab: false,
+            should_open_in_place: false,
+            close_replaced_pane: false,
+            skip_cache: false,
+            tab_id: None,
+        };
+        assert!(launch("configuration", true)
+            .matches_binding_for_shortcut(&launch("configuration", false)));
+        assert!(!launch("configuration", true)
+            .matches_binding_for_shortcut(&launch("session-manager", true)));
+        let new_pane = |direction| Action::NewPane {
+            direction,
+            pane_name: None,
+            start_suppressed: false,
+        };
+        assert!(new_pane(None).matches_binding_for_shortcut(&new_pane(Some(Direction::Down))));
+        assert!(!new_pane(Some(Direction::Up))
+            .matches_binding_for_shortcut(&new_pane(Some(Direction::Down))));
+    }
 
     #[test]
     fn test_send_keys_single_key() {
@@ -3177,6 +3590,16 @@ mod tests {
         assert!(matches!(actions[0], Action::TogglePanePinned));
     }
 
+    #[test]
+    fn test_toggle_mirror_resize() {
+        let cli_action = CliAction::ToggleMirrorResize;
+        let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
+        assert!(result.is_ok());
+        let actions = result.unwrap();
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], Action::ToggleMirrorResize));
+    }
+
     // Extra pane tests
     #[test]
     fn test_scroll_up_with_plugin_pane_id() {
@@ -3287,6 +3710,28 @@ mod tests {
         let actions = result.expect("ToggleTheme conversion should succeed");
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], Action::ToggleTheme));
+    }
+
+    #[test]
+    fn test_dismiss_info_popups_cli_to_action() {
+        let actions = Action::actions_from_cli(
+            CliAction::DismissInfoPopups,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(actions, vec![Action::DismissInfoPopups]);
+    }
+
+    #[test]
+    fn test_open_context_menu_cli_to_action() {
+        let actions = Action::actions_from_cli(
+            CliAction::OpenContextMenu,
+            Box::new(|| PathBuf::from("/tmp")),
+            None,
+        )
+        .unwrap();
+        assert_eq!(actions, vec![Action::OpenContextMenu]);
     }
 
     // 21. RenameTab
@@ -3721,6 +4166,7 @@ mod tests {
             layout_string: Some("layout {\n    pane\n}\n".into()),
             layout_dir: None,
             cwd: None,
+            close_current: false,
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -3747,6 +4193,7 @@ mod tests {
             layout_string: Some("invalid { kdl".into()),
             layout_dir: None,
             cwd: None,
+            close_current: false,
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_err());
@@ -3783,6 +4230,7 @@ mod tests {
             borderless: None,
             tab_id: None,
             border_style: border_style.map(|s| s.to_string()),
+            notify: Default::default(),
         }
     }
 
@@ -3974,6 +4422,7 @@ mod tests {
             borderless: None,
             tab_id: Some(3),
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4019,6 +4468,7 @@ mod tests {
             borderless: None,
             tab_id: None,
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4064,6 +4514,7 @@ mod tests {
             borderless: None,
             tab_id: None,
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4111,6 +4562,7 @@ mod tests {
             borderless: None,
             tab_id: None,
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_err());
@@ -4149,6 +4601,7 @@ mod tests {
             borderless: None,
             tab_id: Some(5),
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4194,6 +4647,7 @@ mod tests {
             borderless: None,
             tab_id: Some(1),
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4239,6 +4693,7 @@ mod tests {
             borderless: None,
             tab_id: Some(2),
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4350,6 +4805,7 @@ mod tests {
             borderless: None,
             tab_id: Some(2),
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4395,6 +4851,7 @@ mod tests {
             borderless: None,
             tab_id: Some(1),
             border_style: None,
+            notify: Default::default(),
         };
         let result = Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None);
         assert!(result.is_ok());
@@ -4406,5 +4863,86 @@ mod tests {
             },
             _ => panic!("Expected NewFloatingPluginPane action"),
         }
+    }
+
+    fn set_resurrect_command_from_cli(
+        pane_id: Option<&str>,
+        cwd: Option<&str>,
+        clear: bool,
+        command: Vec<&str>,
+    ) -> Result<Vec<Action>, String> {
+        let cli_action = CliAction::SetResurrectCommand {
+            pane_id: pane_id.map(|p| p.to_string()),
+            cwd: cwd.map(PathBuf::from),
+            clear,
+            command: command.into_iter().map(|c| c.to_string()).collect(),
+        };
+        Action::actions_from_cli(cli_action, Box::new(|| PathBuf::from("/tmp")), None)
+    }
+
+    #[test]
+    fn test_set_resurrect_command_with_pane_id() {
+        let actions = set_resurrect_command_from_cli(
+            Some("terminal_4"),
+            None,
+            false,
+            vec!["opencode", "-s", "ses_abc"],
+        )
+        .unwrap();
+        assert_eq!(
+            actions,
+            vec![Action::SetResurrectCommand {
+                pane_id: PaneId::Terminal(4),
+                resurrect: Some(ResurrectCommand {
+                    command: PathBuf::from("opencode"),
+                    args: vec!["-s".to_string(), "ses_abc".to_string()],
+                    cwd: None,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_set_resurrect_command_resolves_cwd() {
+        let actions =
+            set_resurrect_command_from_cli(Some("4"), Some("project"), false, vec!["opencode"])
+                .unwrap();
+        assert_eq!(
+            actions,
+            vec![Action::SetResurrectCommand {
+                pane_id: PaneId::Terminal(4),
+                resurrect: Some(ResurrectCommand {
+                    command: PathBuf::from("opencode"),
+                    args: vec![],
+                    cwd: Some(PathBuf::from("/tmp/project")),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_set_resurrect_command_clear() {
+        let actions =
+            set_resurrect_command_from_cli(Some("terminal_4"), None, true, vec![]).unwrap();
+        assert_eq!(
+            actions,
+            vec![Action::SetResurrectCommand {
+                pane_id: PaneId::Terminal(4),
+                resurrect: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_set_resurrect_command_rejects_plugin_pane() {
+        let result =
+            set_resurrect_command_from_cli(Some("plugin_2"), None, false, vec!["opencode"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_resurrect_command_rejects_malformed_pane_id() {
+        let result = set_resurrect_command_from_cli(Some("nope"), None, false, vec!["opencode"]);
+        assert!(result.is_err());
     }
 }
