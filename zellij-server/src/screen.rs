@@ -1061,7 +1061,7 @@ pub enum ScreenInstruction {
         tab_id: usize,
         run_plugin_or_alias: RunPluginOrAlias,
         placement: crate::tab::PopupPlacement,
-        kind: crate::tab::PopupKind,
+        behavior: crate::tab::PopupBehavior,
         width: usize,
         height: usize,
         anchor_pane: Option<PaneId>,
@@ -1072,6 +1072,8 @@ pub enum ScreenInstruction {
         caller_pane_id: Option<PaneId>,
         placement: zellij_utils::data::PipePopupPlacement,
         focused: bool,
+        capture_all_keys: bool,
+        outside_click: zellij_utils::data::OutsideClick,
     },
     OpenPromptPopup {
         caller: crate::plugins::PromptCaller,
@@ -1081,7 +1083,7 @@ pub enum ScreenInstruction {
         placement: Option<zellij_utils::prompt::PromptPlacement>,
         focused: bool,
         capture_all_keys: bool,
-        closes_on_outside_click: bool,
+        outside_click: zellij_utils::data::OutsideClick,
     },
     CloseTopPopup(ClientId),
     ScrollPopup(ClientId, crate::route::PopupScroll),
@@ -14087,6 +14089,16 @@ pub(crate) fn screen_thread_main(
                                 screen.render(None)?;
                                 screen.log_and_report_session_state()?;
                             } else {
+                                let floating_session_manager = (should_float
+                                    && !should_open_in_place
+                                    && popups::is_session_manager(&run_plugin))
+                                .then(|| screen.get_active_tab(client_id).ok())
+                                .flatten()
+                                .map(popups::session_manager_coordinates);
+                                let (size, coordinates) = match floating_session_manager {
+                                    Some((coordinates, content)) => (content, Some(coordinates)),
+                                    None => (Size::default(), None),
+                                };
                                 screen
                                     .bus
                                     .senders
@@ -14099,11 +14111,11 @@ pub(crate) fn screen_thread_main(
                                         tab_index,
                                         None,
                                         client_id,
-                                        Size::default(),
+                                        size,
                                         skip_cache,
                                         None,
                                         None,
-                                        None,
+                                        coordinates,
                                         completion_tx,
                                     ))?;
                             }
@@ -14426,7 +14438,9 @@ pub(crate) fn screen_thread_main(
                     }
                 });
 
-                if !found {
+                if found {
+                    screen.report_popup_state_for_plugin(plugin_id);
+                } else {
                     log::error!("PluginId '{}' not found - caching request", plugin_id);
                     pending_events_waiting_for_client.push(
                         ScreenInstruction::RequestPluginPermissions(plugin_id, plugin_permission),
@@ -15429,7 +15443,7 @@ pub(crate) fn screen_thread_main(
                 tab_id,
                 run_plugin_or_alias,
                 placement,
-                kind,
+                behavior,
                 width,
                 height,
                 anchor_pane,
@@ -15440,7 +15454,7 @@ pub(crate) fn screen_thread_main(
                     tab_id,
                     run_plugin_or_alias,
                     placement,
-                    kind,
+                    behavior,
                     width,
                     height,
                     anchor_pane,
@@ -15456,6 +15470,8 @@ pub(crate) fn screen_thread_main(
                 caller_pane_id,
                 placement,
                 focused,
+                capture_all_keys,
+                outside_click,
             } => {
                 screen.open_pipe_popup(
                     pipe_id,
@@ -15463,6 +15479,8 @@ pub(crate) fn screen_thread_main(
                     caller_pane_id,
                     placement,
                     focused,
+                    capture_all_keys,
+                    outside_click,
                 );
             },
             ScreenInstruction::OpenPromptPopup {
@@ -15473,7 +15491,7 @@ pub(crate) fn screen_thread_main(
                 placement,
                 focused,
                 capture_all_keys,
-                closes_on_outside_click,
+                outside_click,
             } => {
                 screen.open_prompt_popup(
                     caller,
@@ -15483,7 +15501,7 @@ pub(crate) fn screen_thread_main(
                     placement,
                     focused,
                     capture_all_keys,
-                    closes_on_outside_click,
+                    outside_click,
                 );
             },
             ScreenInstruction::CloseTopPopup(client_id) => {

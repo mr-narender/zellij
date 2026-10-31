@@ -12589,6 +12589,154 @@ fn alt_click_is_forwarded_to_a_pane_the_client_is_descended_into() {
 }
 
 #[test]
+fn ctrl_drag_is_forwarded_to_a_pane_the_client_is_descended_into() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+
+    let mut pty_instruction_bus = MockPtyInstructionBus::new();
+    let mut tab = create_new_tab_with_mock_pty_writer(
+        size,
+        ModeInfo::default(),
+        pty_instruction_bus.pty_write_sender(),
+    );
+    pty_instruction_bus.start();
+
+    tab.handle_pty_bytes(1, Vec::from("\u{1b}[?1002h\u{1b}[?1006h".as_bytes()))
+        .unwrap();
+
+    let mousebinds = zellij_utils::input::config_settings::default_config()
+        .mousebinds
+        .clone();
+    for event in [
+        MouseEvent::new_left_press_with_ctrl_event(Position::new(5, 71)),
+        MouseEvent::new_left_motion_with_ctrl_event(Position::new(12, 100)),
+        MouseEvent::new_left_release_with_ctrl_event(Position::new(12, 100)),
+    ] {
+        tab.handle_mouse_event_with_passthrough(
+            &event,
+            client_id,
+            Some(PaneId::Terminal(1)),
+            mousebinds.clone(),
+        )
+        .unwrap();
+    }
+
+    pty_instruction_bus.exit();
+
+    assert_eq!(
+        pty_instruction_bus.clone_output(),
+        vec![
+            "\u{1b}[<16;71;5M".to_string(),
+            "\u{1b}[<48;100;12M".to_string(),
+            "\u{1b}[<16;100;12m".to_string(),
+        ],
+        "a ctrl drag inside a descended pane must reach the guest session"
+    );
+    assert!(
+        tab.pane_drawings.get(&client_id).is_none(),
+        "a ctrl drag inside a descended pane must not draw a host floating pane"
+    );
+    assert_eq!(
+        tab.get_floating_panes().count(),
+        0,
+        "a ctrl drag inside a descended pane must not open a host floating pane"
+    );
+}
+
+#[test]
+fn clicking_an_unfocused_pane_showing_the_nested_session_modal_focuses_it() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab(size, ModeInfo::default());
+    tab.vertical_split(PaneId::Terminal(2), None, client_id, None, None)
+        .unwrap();
+    tab.set_guest_modal_on_pane(PaneId::Terminal(1), &[client_id]);
+    assert_eq!(tab.get_active_pane_id(client_id), Some(PaneId::Terminal(2)));
+
+    let effect = tab
+        .handle_mouse_event(
+            &MouseEvent::new_left_press_event(Position::new(5, 10)),
+            client_id,
+        )
+        .unwrap();
+    tab.handle_mouse_event(
+        &MouseEvent::new_left_release_event(Position::new(5, 10)),
+        client_id,
+    )
+    .unwrap();
+
+    assert!(effect.state_changed);
+    assert_eq!(
+        tab.get_active_pane_id(client_id),
+        Some(PaneId::Terminal(1)),
+        "clicking a pane that shows the nested session modal must focus it"
+    );
+    assert!(
+        tab.pane_has_guest_modal_for_client(PaneId::Terminal(1), client_id),
+        "the modal stays up after the focusing click"
+    );
+}
+
+#[test]
+fn hovering_the_nested_session_modal_options_marks_them_as_hovered() {
+    let size = Size {
+        cols: 121,
+        rows: 40,
+    };
+    let client_id = 1;
+    let mut tab = create_new_tab(size, ModeInfo::default());
+    tab.set_guest_modal_on_pane(PaneId::Terminal(1), &[client_id]);
+    let hover_of = |tab: &Tab| {
+        tab.get_pane_with_id(PaneId::Terminal(1))
+            .and_then(|pane| pane.guest_modal_hover(client_id))
+    };
+
+    let mut hovered_options = vec![];
+    let mut last_hovered_line = None;
+    for line in 0..size.rows as i32 {
+        let previous = hover_of(&tab);
+        let effect = tab
+            .handle_mouse_event(
+                &MouseEvent::new_buttonless_motion(Position::new(line, 60)),
+                client_id,
+            )
+            .unwrap();
+        let current = hover_of(&tab);
+        if current != previous {
+            assert!(effect.state_changed, "a hover change re-renders");
+        }
+        if let Some(option) = current {
+            last_hovered_line = Some(line);
+            if hovered_options.last() != Some(&option) {
+                hovered_options.push(option);
+            }
+        }
+    }
+    assert_eq!(hovered_options, vec![0, 1]);
+
+    tab.handle_mouse_event(
+        &MouseEvent::new_buttonless_motion(Position::new(last_hovered_line.unwrap(), 60)),
+        client_id,
+    )
+    .unwrap();
+    assert_eq!(hover_of(&tab), Some(1));
+    let effect = tab
+        .handle_mouse_event(
+            &MouseEvent::new_buttonless_motion(Position::new(1, 1)),
+            client_id,
+        )
+        .unwrap();
+    assert!(effect.state_changed);
+    assert_eq!(hover_of(&tab), None, "leaving the options clears the hover");
+}
+
+#[test]
 fn alt_click_still_groups_a_mouse_tracking_pane_the_client_is_not_descended_into() {
     let size = Size {
         cols: 121,
@@ -13143,7 +13291,7 @@ fn open_test_popup(tab: &mut Tab, client_id: ClientId, plugin_id: u32) {
         client_id,
         plugin_id,
         crate::tab::PopupPlacement::At(Position::new(3, 3)),
-        crate::tab::PopupKind::Menu,
+        crate::tab::PopupBehavior::menu(),
         20,
         6,
         None,
@@ -13157,7 +13305,7 @@ fn open_test_prompt_popup(tab: &mut Tab, client_id: ClientId, plugin_id: u32, li
         client_id,
         plugin_id,
         crate::tab::PopupPlacement::At(Position::new(line, 3)),
-        crate::tab::PopupKind::Prompt,
+        crate::tab::PopupBehavior::prompt(),
         20,
         4,
         None,
@@ -13263,7 +13411,7 @@ fn popup_is_placed_inside_the_screen_and_resized_on_request() {
         client_id,
         42,
         crate::tab::PopupPlacement::At(Position::new(18, 115)),
-        crate::tab::PopupKind::Menu,
+        crate::tab::PopupBehavior::menu(),
         20,
         6,
         None,
@@ -13311,7 +13459,7 @@ fn click_outside_popup_requests_close_and_click_inside_is_consumed() {
 }
 
 #[test]
-fn a_click_outside_an_explanation_popup_closes_it_but_not_outside_a_prompt() {
+fn a_click_outside_closes_a_popup_set_to_close_but_not_one_set_to_block() {
     let size = Size {
         cols: 121,
         rows: 20,
@@ -13321,15 +13469,16 @@ fn a_click_outside_an_explanation_popup_closes_it_but_not_outside_a_prompt() {
     let (plugin_sender, _plugin_receiver) = channels::unbounded();
     tab.senders
         .replace_to_plugin(SenderWithContext::new(plugin_sender));
-    for (plugin_id, kind, expected) in [
+    for (plugin_id, behavior, expected) in [
         (
             42,
-            crate::tab::PopupKind::Explanation,
+            crate::tab::PopupBehavior::prompt()
+                .on_outside_click(zellij_utils::data::OutsideClick::Close),
             crate::tab::PopupMouseOutcome::CloseRequested,
         ),
         (
             43,
-            crate::tab::PopupKind::Prompt,
+            crate::tab::PopupBehavior::prompt(),
             crate::tab::PopupMouseOutcome::Consumed,
         ),
     ] {
@@ -13337,7 +13486,7 @@ fn a_click_outside_an_explanation_popup_closes_it_but_not_outside_a_prompt() {
             client_id,
             plugin_id,
             crate::tab::PopupPlacement::At(Position::new(3, 3)),
-            kind,
+            behavior,
             20,
             6,
             None,
@@ -13447,7 +13596,7 @@ fn a_menu_popup_replaces_only_menus_and_never_a_prompt() {
             client_id,
             44,
             crate::tab::PopupPlacement::At(Position::new(3, 3)),
-            crate::tab::PopupKind::Menu,
+            crate::tab::PopupBehavior::menu(),
             20,
             6,
             None,
@@ -13504,7 +13653,7 @@ fn prompt_popup_centered_in_a_pane_stays_centered_when_resized() {
         client_id,
         42,
         crate::tab::PopupPlacement::CenteredIn(area),
-        crate::tab::PopupKind::Prompt,
+        crate::tab::PopupBehavior::prompt(),
         20,
         6,
         None,
@@ -17611,7 +17760,7 @@ fn open_test_info_popup(
         client_id,
         plugin_id,
         crate::tab::PopupPlacement::Corner(corner),
-        crate::tab::PopupKind::Info,
+        crate::tab::PopupBehavior::info(),
         30,
         rows,
         None,
@@ -17798,7 +17947,7 @@ fn a_held_back_popup_asking_for_permissions_is_shown() {
         client_id,
         42,
         crate::tab::PopupPlacement::At(Position::new(3, 3)),
-        crate::tab::PopupKind::Prompt,
+        crate::tab::PopupBehavior::prompt(),
         60,
         8,
         None,
@@ -17930,7 +18079,7 @@ fn a_popup_plugin_shows_its_permission_request_and_takes_the_answer() {
         client_id,
         42,
         crate::tab::PopupPlacement::At(Position::new(3, 3)),
-        crate::tab::PopupKind::Prompt,
+        crate::tab::PopupBehavior::prompt(),
         60,
         8,
         None,
@@ -17971,6 +18120,108 @@ fn a_popup_plugin_shows_its_permission_request_and_takes_the_answer() {
     assert!(tab.send_key_to_popup(client_id, key('a'), vec![b'a'], false));
     let (keys, _) = keys_sent_to_plugin(&plugin_receiver, 42);
     assert_eq!(keys, vec![key('a')]);
+}
+
+fn ask_popup_for_read_permission(tab: &mut Tab, plugin_id: u32) {
+    tab.request_plugin_permissions(
+        plugin_id,
+        Some(zellij_utils::data::PluginPermission::new(
+            "my-plugin".to_owned(),
+            vec![zellij_utils::data::PermissionType::ReadApplicationState],
+        )),
+    );
+}
+
+#[test]
+fn an_unfocused_popup_takes_focus_while_it_asks_for_permissions() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let (mut tab, plugin_receiver) = create_new_tab_with_plugin_receiver(size, ModeInfo::default());
+    open_test_prompt_popup(&mut tab, client_id, 42, 8);
+    open_test_info_popup(
+        &mut tab,
+        client_id,
+        50,
+        zellij_utils::data::PopupCorner::TopRight,
+        4,
+    );
+    assert_eq!(tab.popup_plugin_id(client_id), Some(42));
+    ask_popup_for_read_permission(&mut tab, 50);
+    assert_eq!(tab.popup_plugin_id(client_id), Some(50));
+    keys_sent_to_plugin(&plugin_receiver, 50);
+    let key =
+        |c: char| zellij_utils::data::KeyWithModifier::new(zellij_utils::data::BareKey::Char(c));
+    assert!(tab.send_key_to_popup(client_id, key('y'), vec![b'y'], false));
+    let (_, results) = keys_sent_to_plugin(&plugin_receiver, 50);
+    assert_eq!(results.len(), 1);
+    assert_eq!(tab.popup_plugin_id(client_id), Some(42));
+    assert_eq!(tab.unfocused_popup_plugin_ids(client_id), vec![50]);
+}
+
+#[test]
+fn dismissing_info_popups_keeps_a_popup_asking_for_permissions() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let (mut tab, plugin_receiver) = create_new_tab_with_plugin_receiver(size, ModeInfo::default());
+    open_test_info_popup(
+        &mut tab,
+        client_id,
+        50,
+        zellij_utils::data::PopupCorner::TopRight,
+        4,
+    );
+    ask_popup_for_read_permission(&mut tab, 50);
+    assert!(tab.close_info_popups(client_id).is_empty());
+    assert_eq!(tab.popup_plugin_id(client_id), Some(50));
+    keys_sent_to_plugin(&plugin_receiver, 50);
+    let key =
+        |c: char| zellij_utils::data::KeyWithModifier::new(zellij_utils::data::BareKey::Char(c));
+    assert!(tab.send_key_to_popup(client_id, key('y'), vec![b'y'], false));
+    assert_eq!(tab.close_info_popups(client_id), vec![50]);
+}
+
+#[test]
+fn a_popup_set_to_close_blocks_outside_clicks_while_it_asks_for_permissions() {
+    let size = Size {
+        cols: 121,
+        rows: 20,
+    };
+    let client_id = 1;
+    let (mut tab, plugin_receiver) = create_new_tab_with_plugin_receiver(size, ModeInfo::default());
+    tab.open_popup(
+        client_id,
+        42,
+        crate::tab::PopupPlacement::At(Position::new(3, 3)),
+        crate::tab::PopupBehavior::prompt()
+            .on_outside_click(zellij_utils::data::OutsideClick::Close),
+        60,
+        8,
+        None,
+        String::from("prompt"),
+    )
+    .unwrap();
+    ask_popup_for_read_permission(&mut tab, 42);
+    let outside = MouseEvent::new_left_press_event(Position::new(15, 100));
+    assert_eq!(
+        tab.handle_popup_mouse_event(&outside, client_id),
+        Some(crate::tab::PopupMouseOutcome::Consumed)
+    );
+    keys_sent_to_plugin(&plugin_receiver, 42);
+    let key =
+        |c: char| zellij_utils::data::KeyWithModifier::new(zellij_utils::data::BareKey::Char(c));
+    assert!(tab.send_key_to_popup(client_id, key('n'), vec![b'n'], false));
+    let (_, results) = keys_sent_to_plugin(&plugin_receiver, 42);
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        tab.handle_popup_mouse_event(&outside, client_id),
+        Some(crate::tab::PopupMouseOutcome::CloseRequested)
+    );
 }
 
 fn center_of_pane(tab: &Tab, pane_id: PaneId) -> Position {
@@ -18814,7 +19065,7 @@ fn open_test_session_card(
     tab: &mut Tab,
     client_id: ClientId,
     plugin_id: u32,
-    kind: crate::tab::PopupKind,
+    kind: crate::tab::PopupBehavior,
 ) {
     let run = RunPluginOrAlias::from_url("session-manager", &None, None, None).unwrap();
     tab.open_popup(
@@ -18926,7 +19177,7 @@ fn the_session_card_popup_is_found_by_its_location_and_focus() {
         zellij_utils::data::PopupCorner::TopLeft,
         4,
     );
-    open_test_session_card(&mut tab, client_id, 70, crate::tab::PopupKind::Info);
+    open_test_session_card(&mut tab, client_id, 70, crate::tab::PopupBehavior::info());
     assert_eq!(
         tab.popup_for_location(client_id, "session-manager"),
         Some((70, false))
@@ -18934,7 +19185,7 @@ fn the_session_card_popup_is_found_by_its_location_and_focus() {
     let mut unfocused = tab.unfocused_popup_plugin_ids(client_id);
     unfocused.sort();
     assert_eq!(unfocused, vec![50, 70]);
-    tab.set_popup_kind(70, crate::tab::PopupKind::Prompt);
+    tab.set_popup_focused(70, true);
     assert_eq!(
         tab.popup_for_location(client_id, "session-manager"),
         Some((70, true))
@@ -18954,7 +19205,7 @@ fn a_plugin_pane_can_be_dumped_with_its_colours_for_previews() {
     let (plugin_sender, _plugin_receiver) = channels::unbounded();
     tab.senders
         .replace_to_plugin(SenderWithContext::new(plugin_sender));
-    open_test_session_card(&mut tab, client_id, 80, crate::tab::PopupKind::Info);
+    open_test_session_card(&mut tab, client_id, 80, crate::tab::PopupBehavior::info());
     tab.handle_plugin_bytes(80, client_id, "\u{1b}[31mplugin text".as_bytes().to_vec())
         .unwrap();
     let popup = &tab.popups.get(&client_id).unwrap()[0];

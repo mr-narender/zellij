@@ -11,7 +11,7 @@ mod swap_layouts;
 use crate::plugins::PluginId;
 use copy_command::CopyCommand;
 pub use mouse_handler::{ContextMenuRequest, MouseEffect, MouseHandler, PaneEdge, PaneResizeState};
-pub use popup::{place_popup, PopupKind, PopupMouseOutcome, PopupPlacement, POPUP_Z_INDEX};
+pub use popup::{place_popup, PopupBehavior, PopupMouseOutcome, PopupPlacement, POPUP_Z_INDEX};
 use std::env::temp_dir;
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -593,6 +593,12 @@ pub trait Pane {
     fn clear_all_guest_modals(&mut self) {}
     fn guest_modal_selection(&self, _client_id: ClientId) -> Option<usize> {
         None
+    }
+    fn guest_modal_hover(&self, _client_id: ClientId) -> Option<usize> {
+        None
+    }
+    fn set_guest_modal_hover(&mut self, _client_id: ClientId, _option: Option<usize>) -> bool {
+        false
     }
     fn has_guest_modal_for_any_client(&self) -> bool {
         false
@@ -2615,6 +2621,9 @@ impl Tab {
             } else {
                 None
             };
+            if is_last_connected_client {
+                self.forget_held_mouse_gestures();
+            }
         }
         let was_dimmed = self.dimmed_clients.contains(&client_id);
         self.mode_info.borrow_mut().remove(&client_id);
@@ -2628,6 +2637,15 @@ impl Tab {
             self.set_client_dimmed(client_id, false);
             self.set_force_render();
         }
+    }
+    fn forget_held_mouse_gestures(&mut self) {
+        if let Some(pane_id) = self.selecting_with_mouse_in_pane.take() {
+            if let Some(pane) = self.get_pane_with_id_mut(pane_id) {
+                pane.reset_selection(None);
+            }
+        }
+        self.pane_being_resized_with_mouse = None;
+        self.floating_panes.forget_pane_being_moved_with_mouse();
     }
     pub fn drain_connected_clients(
         &mut self,
@@ -4611,6 +4629,34 @@ impl Tab {
         } else {
             false
         }
+    }
+    pub fn set_guest_modal_hover_for_client(
+        &mut self,
+        client_id: ClientId,
+        hovered: Option<(PaneId, usize)>,
+    ) -> bool {
+        let mut changed = false;
+        for pane_id in self.get_all_pane_ids() {
+            let option = hovered
+                .filter(|(hovered_pane_id, _)| *hovered_pane_id == pane_id)
+                .map(|(_, option)| option);
+            if let Some(pane) = self
+                .tiled_panes
+                .get_pane_mut(pane_id)
+                .or_else(|| self.floating_panes.get_pane_mut(pane_id))
+                .or_else(|| {
+                    self.suppressed_panes
+                        .values_mut()
+                        .find(|s_p| s_p.1.pid() == pane_id)
+                        .map(|s_p| &mut s_p.1)
+                })
+            {
+                if pane.set_guest_modal_hover(client_id, option) {
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
     pub fn clear_guest_modal_for_client_on_all_panes(&mut self, client_id: ClientId) {
         for pane_id in self.get_all_pane_ids() {
@@ -8604,6 +8650,7 @@ impl Tab {
             if asks_for_permissions {
                 self.reveal_popup(pid);
             }
+            self.set_popup_awaiting_permission(pid, asks_for_permissions);
             self.set_force_render();
             return;
         }

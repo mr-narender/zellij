@@ -1365,6 +1365,7 @@ pub enum Event {
     GlobalAttentionUpdate(crate::attention::GlobalAttention),
     SessionHistoryUpdate(crate::session_history::SessionHistoryInfo),
     DesktopIntegration(String),
+    PluginSettingsEntries(Vec<PluginSettingsEntry>),
     LiveViewStateChanged {
         target: Option<PaneAddress>,
         state: MirrorState,
@@ -1546,6 +1547,16 @@ pub struct SavedTabPreview {
     pub focused: bool,
     pub panes: Vec<SavedPanePreview>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct PluginSettingsEntry {
+    pub plugin_id: u32,
+    pub title: String,
+}
+
+pub const OPEN_PLUGIN_SETTINGS_MESSAGE: &str = "zellij:open_plugin_settings";
+
+pub const OPEN_PLUGIN_SETTINGS_CLIENT_ID_ARG: &str = "client_id";
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SavedSessionPreview {
@@ -4454,10 +4465,43 @@ impl fmt::Display for PopupCorner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize, Serialize)]
+pub enum OutsideClick {
+    #[default]
+    Block,
+    Close,
+}
+
+impl FromStr for OutsideClick {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "block" => Ok(OutsideClick::Block),
+            "close" => Ok(OutsideClick::Close),
+            other => Err(format!(
+                "invalid outside click behavior '{}', expected one of: block, close",
+                other
+            )),
+        }
+    }
+}
+
+impl fmt::Display for OutsideClick {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            OutsideClick::Block => write!(f, "block"),
+            OutsideClick::Close => write!(f, "close"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct PopupOptions {
     pub focused: bool,
     pub corner: Option<PopupCorner>,
+    pub capture_all_keys: bool,
+    pub outside_click: Option<OutsideClick>,
 }
 
 impl Default for PopupOptions {
@@ -4465,7 +4509,28 @@ impl Default for PopupOptions {
         PopupOptions {
             focused: true,
             corner: None,
+            capture_all_keys: false,
+            outside_click: None,
         }
+    }
+}
+
+impl PopupOptions {
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+    pub fn corner(mut self, corner: PopupCorner) -> Self {
+        self.corner = Some(corner);
+        self
+    }
+    pub fn capture_all_keys(mut self, capture_all_keys: bool) -> Self {
+        self.capture_all_keys = capture_all_keys;
+        self
+    }
+    pub fn outside_click(mut self, outside_click: OutsideClick) -> Self {
+        self.outside_click = Some(outside_click);
+        self
     }
 }
 
@@ -5367,6 +5432,8 @@ pub enum PluginCommand {
     ToggleBars(Vec<String>),
     HideBars(Vec<String>),
     ShowBars,
+    RegisterSettingsEntry(String),
+    UnregisterSettingsEntry,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -5379,6 +5446,9 @@ pub enum SettingSection {
     Keybinds,
     Blocks,
     Attention,
+    AttentionPopups,
+    AttentionBadge,
+    AttentionBadgeColors,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -5618,8 +5688,22 @@ setting_keys! {
     AttentionIdleSilenceSecs => (Attention, "idle_silence_secs", false, Number),
     AttentionStartupCard => (Attention, "startup_card", false, Text),
     AttentionTrayIcon => (Attention, "tray_icon", false, Flag),
-    AttentionDesktopNotifications => (Attention, "desktop_notifications", false, Text),
     AttentionNotificationDetails => (Attention, "notification_details", false, Flag),
+    AttentionPopupNeedsYou => (AttentionPopups, "needs_you", false, Flag),
+    AttentionPopupFailed => (AttentionPopups, "failed", false, Flag),
+    AttentionPopupDone => (AttentionPopups, "done", false, Flag),
+    AttentionBadgeNeedsYou => (AttentionBadge, "needs_you", false, Flag),
+    AttentionBadgeFailed => (AttentionBadge, "failed", false, Flag),
+    AttentionBadgeDone => (AttentionBadge, "done", false, Flag),
+    AttentionBadgeWorking => (AttentionBadge, "working", false, Flag),
+    AttentionBadgeQuiet => (AttentionBadge, "quiet", false, Flag),
+    AttentionBadgeNewOutput => (AttentionBadge, "new_output", false, Flag),
+    AttentionBadgeColorNeedsYou => (AttentionBadgeColors, "needs_you", false, Colour),
+    AttentionBadgeColorFailed => (AttentionBadgeColors, "failed", false, Colour),
+    AttentionBadgeColorDone => (AttentionBadgeColors, "done", false, Colour),
+    AttentionBadgeColorWorking => (AttentionBadgeColors, "working", false, Colour),
+    AttentionBadgeColorQuiet => (AttentionBadgeColors, "quiet", false, Colour),
+    AttentionBadgeColorNewOutput => (AttentionBadgeColors, "new_output", false, Colour),
 }
 
 impl SettingKey {
@@ -5637,6 +5721,13 @@ impl SettingKey {
             SettingSection::Terminal => format!("terminal.{}", self.kdl_name()),
             SettingSection::TerminalTheme => format!("terminal.theme.{}", self.kdl_name()),
             SettingSection::Attention => format!("attention.{}", self.kdl_name()),
+            SettingSection::AttentionPopups => {
+                format!("attention.desktop_notifications.{}", self.kdl_name())
+            },
+            SettingSection::AttentionBadge => format!("attention.tray_badge.{}", self.kdl_name()),
+            SettingSection::AttentionBadgeColors => {
+                format!("attention.tray_badge_colors.{}", self.kdl_name())
+            },
         }
     }
     pub fn from_id(id: &str) -> Option<SettingKey> {
@@ -5650,6 +5741,9 @@ impl SettingKey {
             SettingSection::Terminal => &["terminal"],
             SettingSection::TerminalTheme => &["terminal", "theme"],
             SettingSection::Attention => &["attention"],
+            SettingSection::AttentionPopups => &["attention", "desktop_notifications"],
+            SettingSection::AttentionBadge => &["attention", "tray_badge"],
+            SettingSection::AttentionBadgeColors => &["attention", "tray_badge_colors"],
         }
     }
     pub fn is_terminal(&self) -> bool {
@@ -6207,8 +6301,36 @@ mod popup_placement_tests {
             PopupOptions {
                 focused: true,
                 corner: None,
+                capture_all_keys: false,
+                outside_click: None,
             }
         );
+    }
+
+    #[test]
+    fn popup_options_builders_set_each_option() {
+        assert_eq!(
+            PopupOptions::default()
+                .focused(false)
+                .corner(PopupCorner::BottomLeft)
+                .capture_all_keys(true)
+                .outside_click(OutsideClick::Close),
+            PopupOptions {
+                focused: false,
+                corner: Some(PopupCorner::BottomLeft),
+                capture_all_keys: true,
+                outside_click: Some(OutsideClick::Close),
+            }
+        );
+    }
+
+    #[test]
+    fn outside_click_parses_its_own_display_form() {
+        for outside_click in [OutsideClick::Block, OutsideClick::Close] {
+            assert_eq!(outside_click.to_string().parse(), Ok(outside_click));
+        }
+        assert_eq!(" Close ".parse::<OutsideClick>(), Ok(OutsideClick::Close));
+        assert!("unfocus".parse::<OutsideClick>().is_err());
     }
 }
 
