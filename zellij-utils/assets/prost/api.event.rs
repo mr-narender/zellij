@@ -358,6 +358,18 @@ pub struct PaneAttention {
     pub watched: bool,
     #[prost(bool, tag="11")]
     pub from_watch: bool,
+    #[prost(message, optional, tag="12")]
+    pub remembered: ::core::option::Option<RememberedStatus>,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RememberedStatus {
+    #[prost(string, tag="1")]
+    pub status: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub text: ::prost::alloc::string::String,
+    #[prost(uint64, tag="3")]
+    pub since_ms: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1929,6 +1941,7 @@ pub enum ClickedPaneAction {
     ToggleWatch = 8,
     HideBar = 9,
     PasteFromClipboard = 10,
+    ToggleStackListOrientation = 11,
 }
 impl ClickedPaneAction {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1948,6 +1961,7 @@ impl ClickedPaneAction {
             ClickedPaneAction::ToggleWatch => "ClickedPaneActionToggleWatch",
             ClickedPaneAction::HideBar => "ClickedPaneActionHideBar",
             ClickedPaneAction::PasteFromClipboard => "ClickedPaneActionPasteFromClipboard",
+            ClickedPaneAction::ToggleStackListOrientation => "ClickedPaneActionToggleStackListOrientation",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1964,6 +1978,7 @@ impl ClickedPaneAction {
             "ClickedPaneActionToggleWatch" => Some(Self::ToggleWatch),
             "ClickedPaneActionHideBar" => Some(Self::HideBar),
             "ClickedPaneActionPasteFromClipboard" => Some(Self::PasteFromClipboard),
+            "ClickedPaneActionToggleStackListOrientation" => Some(Self::ToggleStackListOrientation),
             _ => None,
         }
     }

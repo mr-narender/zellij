@@ -401,6 +401,13 @@ fn describe_entry(key: SettingKey) -> SettingInfo {
             "10",
             Everyone,
         ),
+        SettingKey::AttentionTrackCommands => info(
+            "Show long-running commands",
+            "List commands as working once they run longer than the done threshold (interactive programs are skipped)",
+            Toggle,
+            "true",
+            Everyone,
+        ),
         SettingKey::AttentionIdleActivitySecs => info(
             "Busy output for (seconds)",
             "Seconds of steady output before quiet detection applies",
@@ -939,6 +946,13 @@ fn describe_entry(key: SettingKey) -> SettingInfo {
             "Show stacked panes as a list of titles",
             Toggle,
             "true",
+            Everyone,
+        ),
+        SettingKey::StackedPaneListOrientation => info(
+            "Stacked pane list orientation",
+            "Show the titles of new stacks in a column or in a row",
+            Choice(&["vertical", "horizontal"]),
+            "vertical",
             Everyone,
         ),
         SettingKey::MirrorResizesSourcePane => info(
@@ -1867,9 +1881,11 @@ pub fn placement(key: SettingKey) -> (Category, &'static str) {
         Mousebinds => (C::MouseBindings, ""),
         CopyCommand | CopyClipboard | CopyOnSelect => (C::Clipboard, "Clipboard"),
         Osc133CommandSelection | WordSeparators => (C::Clipboard, "Selection"),
-        AutoLayout | StackedResize | StackedPaneList | SwapLayoutNotification => {
-            (C::PanesAndLayouts, "Layouts")
-        },
+        AutoLayout
+        | StackedResize
+        | StackedPaneList
+        | StackedPaneListOrientation
+        | SwapLayoutNotification => (C::PanesAndLayouts, "Layouts"),
         ScrollBufferSize | ScrollbackEditor => (C::PanesAndLayouts, "Scrollback"),
         MirrorResizesSourcePane | LiveViewReleaseKey => (C::PanesAndLayouts, "Mirrors"),
         AttentionEnabled => (C::Notifications, "Pane status"),
@@ -1897,6 +1913,7 @@ pub fn placement(key: SettingKey) -> (Category, &'static str) {
         | AttentionBadgeColorNewOutput => (C::Notifications, "Tray badge colours"),
         AttentionIdleRule
         | AttentionDoneThresholdSecs
+        | AttentionTrackCommands
         | AttentionIdleActivitySecs
         | AttentionIdleSilenceSecs => (C::Notifications, "Timing"),
         SessionName | AttachToSession => (C::Sessions, "Session name"),
