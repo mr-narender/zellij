@@ -5184,7 +5184,7 @@ pub enum PluginCommand {
     PageScrollUpInPaneId(PaneId),
     PageScrollDownInPaneId(PaneId),
     TogglePaneIdFullscreen(PaneId),
-    TogglePaneEmbedOrEjectForPaneId(PaneId),
+    TogglePaneEmbedOrEjectForPaneId(PaneId, bool),
     CloseTabWithIndex(usize), // usize - tab_index
     BreakPanesToNewTab(Vec<PaneId>, Option<String>, bool), // bool -
     // should_change_focus_to_new_tab,
@@ -5612,6 +5612,9 @@ setting_keys! {
     WebClientMacOptionIsMeta => (WebClient, "mac_option_is_meta", true, Flag),
     WebClientBaseUrl => (WebClient, "base_url", true, Text),
     TerminalFont => (Terminal, "font", false, Text),
+    TerminalFontBold => (Terminal, "font_bold", false, Text),
+    TerminalFontItalic => (Terminal, "font_italic", false, Text),
+    TerminalFontBoldItalic => (Terminal, "font_bold_italic", false, Text),
     TerminalFontSize => (Terminal, "font_size", false, Decimal),
     TerminalFontWeight => (Terminal, "font_weight", false, Number),
     TerminalSystemFonts => (Terminal, "system_fonts", false, Flag),
