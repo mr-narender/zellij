@@ -30,6 +30,7 @@ pub struct PaneContentsAndUi<'a> {
     z_index: Option<usize>,
     pane_is_stacked_under: bool,
     pane_is_stacked_over: bool,
+    stacked_render_override: Option<bool>,
     should_draw_pane_frames: bool,
     mouse_is_hovering_over_pane_for_clients: HashSet<ClientId>,
     current_pane_group: HashMap<ClientId, Vec<PaneId>>,
@@ -39,10 +40,12 @@ pub struct PaneContentsAndUi<'a> {
     stack_list_entry_width: Option<usize>,
     stack_list_entry_is_selected: bool,
     stack_list_entry_stack_is_focused: bool,
+    stack_list_entry_is_in_row: bool,
     blank_title: bool,
     mouse_scroll_resize: bool,
     mouse_hover_tips: bool,
     dimmed_for_clients: HashSet<ClientId>,
+    live_views: Option<crate::pane_mirror::SharedLiveViews>,
 }
 
 impl<'a> PaneContentsAndUi<'a> {
@@ -92,6 +95,7 @@ impl<'a> PaneContentsAndUi<'a> {
             z_index,
             pane_is_stacked_under,
             pane_is_stacked_over,
+            stacked_render_override: None,
             should_draw_pane_frames,
             mouse_is_hovering_over_pane_for_clients,
             current_pane_group,
@@ -101,11 +105,52 @@ impl<'a> PaneContentsAndUi<'a> {
             stack_list_entry_width: None,
             stack_list_entry_is_selected: false,
             stack_list_entry_stack_is_focused: false,
+            stack_list_entry_is_in_row: false,
             blank_title: false,
             mouse_scroll_resize,
             mouse_hover_tips,
             dimmed_for_clients,
+            live_views: None,
         }
+    }
+    pub fn set_stacked_render_override(&mut self, stacked: bool) {
+        self.stacked_render_override = Some(stacked);
+    }
+    pub fn set_live_views(&mut self, live_views: crate::pane_mirror::SharedLiveViews) {
+        self.live_views = Some(live_views);
+    }
+    fn render_live_view_for_client(
+        &mut self,
+        client_id: ClientId,
+        plugin_redrew: bool,
+    ) -> Result<()> {
+        let PaneId::Plugin(plugin_pane_id) = self.pane.pid() else {
+            return Ok(());
+        };
+        let Some(live_views) = self.live_views.as_ref() else {
+            return Ok(());
+        };
+        let content = crate::pane_mirror::LiveViewRect::new(
+            self.pane.get_content_x(),
+            self.pane.get_content_y(),
+            self.pane.get_content_columns(),
+            self.pane.get_content_rows(),
+        );
+        let link_handler = self.output.link_handler();
+        let chunks = live_views.borrow_mut().draw(
+            &(plugin_pane_id, client_id),
+            &content,
+            plugin_redrew,
+            link_handler.as_ref(),
+        );
+        if !chunks.is_empty() {
+            self.output
+                .add_character_chunks_to_client(client_id, chunks, self.z_index)
+                .with_context(|| {
+                    format!("failed to render the live view for client {client_id}")
+                })?;
+        }
+        Ok(())
     }
     fn display_slot_of(&self, client_id: ClientId) -> usize {
         self.client_display_slots
@@ -127,10 +172,12 @@ impl<'a> PaneContentsAndUi<'a> {
         stack_list_entry_width: Option<usize>,
         stack_list_entry_is_selected: bool,
         stack_list_entry_stack_is_focused: bool,
+        stack_list_entry_is_in_row: bool,
     ) {
         self.stack_list_entry_width = stack_list_entry_width;
         self.stack_list_entry_is_selected = stack_list_entry_is_selected;
         self.stack_list_entry_stack_is_focused = stack_list_entry_stack_is_focused;
+        self.stack_list_entry_is_in_row = stack_list_entry_is_in_row;
     }
     pub fn render_pane_contents_to_multiple_clients(
         &mut self,
@@ -183,10 +230,13 @@ impl<'a> PaneContentsAndUi<'a> {
     pub fn render_pane_contents_for_client(&mut self, client_id: ClientId) -> Result<()> {
         let err_context = || format!("failed to render pane contents for client {client_id}");
 
+        let rendered = self
+            .pane
+            .render(Some(client_id))
+            .with_context(err_context)?;
+        let plugin_redrew = rendered.is_some();
         if let Some((character_chunks, raw_vte_output, sixel_image_chunks, kitty_image_chunks)) =
-            self.pane
-                .render(Some(client_id))
-                .with_context(err_context)?
+            rendered
         {
             self.output
                 .add_character_chunks_to_client(client_id, character_chunks, self.z_index)
@@ -214,7 +264,7 @@ impl<'a> PaneContentsAndUi<'a> {
                 );
             }
         }
-        Ok(())
+        self.render_live_view_for_client(client_id, plugin_redrew)
     }
     pub fn client_has_guest_modal(&self, client_id: ClientId) -> bool {
         self.pane.guest_modal_selection(client_id).is_some()
@@ -226,6 +276,7 @@ impl<'a> PaneContentsAndUi<'a> {
     pub fn render_guest_modal_for_client(&mut self, client_id: ClientId) -> Result<()> {
         let err_context = || format!("failed to render guest modal for client {client_id}");
         let selection = self.pane.guest_modal_selection(client_id).unwrap_or(0);
+        let hovered = self.pane.guest_modal_hover(client_id);
         let session_name = self
             .pane
             .guest_session_name()
@@ -243,6 +294,7 @@ impl<'a> PaneContentsAndUi<'a> {
             &self.style,
             &session_name,
             selection,
+            hovered,
             &shortcuts,
         );
         self.output
@@ -286,16 +338,12 @@ impl<'a> PaneContentsAndUi<'a> {
                     })
                     .unwrap_or(false);
                 if cursor_is_visible {
-                    if let Some(vte_output) = self.pane.render_fake_cursor(colors.0, colors.1) {
-                        self.output.add_post_vte_instruction_to_client(
+                    if let Some(fake_cursor) = self.pane.render_fake_cursor(colors.0, colors.1) {
+                        self.output.add_character_chunks_to_client(
                             client_id,
-                            &format!(
-                                "\u{1b}[{};{}H\u{1b}[m{}",
-                                self.pane.y() + 1,
-                                self.pane.x() + 1,
-                                vte_output
-                            ),
-                        );
+                            vec![fake_cursor],
+                            self.z_index,
+                        )?;
                     }
                 }
             }
@@ -349,7 +397,9 @@ impl<'a> PaneContentsAndUi<'a> {
         } else {
             None
         };
-        let pane_is_stacked = self.pane.current_geom().is_stacked();
+        let pane_is_stacked = self
+            .stacked_render_override
+            .unwrap_or_else(|| self.pane.current_geom().is_stacked());
         let pane_is_in_group = self
             .current_pane_group
             .get(&client_id)
@@ -360,6 +410,7 @@ impl<'a> PaneContentsAndUi<'a> {
             label: self.pane.stack_list_entry_label(),
             is_selected: self.stack_list_entry_is_selected,
             stack_is_focused: self.stack_list_entry_stack_is_focused,
+            is_in_row: self.stack_list_entry_is_in_row,
             is_emphasized: pane_is_in_group
                 || (self
                     .mouse_is_hovering_over_pane_for_clients
@@ -481,6 +532,8 @@ impl<'a> PaneContentsAndUi<'a> {
             pane_is_on_top_of_stack,
             pane_is_on_bottom_of_stack,
             self.pane_is_stacked_under,
+            self.stacked_render_override
+                .unwrap_or_else(|| self.pane.current_geom().is_stacked()),
         );
     }
     fn frame_color(
