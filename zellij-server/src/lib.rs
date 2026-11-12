@@ -103,7 +103,8 @@ use zellij_utils::{
         theme::{Theme, Themes},
     },
     ipc::{
-        ClientAttributes, ClientToServerMsg, ExitReason, IpcReceiverWithContext, ServerToClientMsg,
+        ClientAttributes, ClientToServerMsg, ExitReason, IpcReceiveError, IpcReceiverWithContext,
+        ServerToClientMsg,
     },
     shared::web_server_base_url,
 };
@@ -112,9 +113,11 @@ pub use zellij_utils::data::ClientId;
 
 pub(crate) type SharedKeybinds = Arc<zellij_utils::data::KeybindsVec>;
 
+#[cfg(not(windows))]
 const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 const PRE_HANDSHAKE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const UNREADABLE_FIRST_MESSAGE_ERROR: &str = "This session could not read the request. It may be running a different version of Zellij that does not support it.";
 
 /// Instructions related to server-side application
 #[derive(Debug, Clone)]
@@ -3321,7 +3324,18 @@ fn handle_new_connection(
     let _ = receiver.set_read_timeout(Some(PRE_HANDSHAKE_READ_TIMEOUT));
     let first_instruction = match receiver.try_recv_client_msg() {
         Ok((instruction, _err_ctx)) => instruction,
-        Err(_) => return Ok(()),
+        Err(IpcReceiveError::Undecodable) => {
+            answer_before_registration(
+                &receiver,
+                #[cfg(windows)]
+                reply_stream,
+                ServerToClientMsg::LogError {
+                    lines: vec![UNREADABLE_FIRST_MESSAGE_ERROR.to_owned()],
+                },
+            );
+            return Ok(());
+        },
+        Err(IpcReceiveError::Disconnected) => return Ok(()),
     };
     let _ = receiver.set_read_timeout(None);
 
@@ -3597,6 +3611,14 @@ impl ServerSocket {
             *path = new_path;
             return Ok(());
         }
+        if cfg!(windows) {
+            // A pipe keeps the name it was created with. Moving only its marker file would list
+            // the session under a name nobody can connect to, so it stays at its old path.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "a named pipe can't be renamed, so the session keeps its socket",
+            ));
+        }
         let new_ownership = SocketOwnership::acquire(&new_path)?;
         if let Err(e) = std::fs::rename(&*path, &new_path) {
             new_ownership.release();
@@ -3692,6 +3714,23 @@ mod server_socket_tests {
         let _second_listener = second.bind().unwrap();
 
         assert!(zellij_utils::consts::ipc_connect(&path).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_renamed_server_keeps_its_pipe_and_marker_where_they_are() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old-name");
+        let new_path = dir.path().join("new-name");
+        let server = ServerSocket::new(old_path.clone());
+        let _listener = server.bind().unwrap();
+
+        assert!(server.rename(new_path.clone()).is_err());
+
+        assert_eq!(server.path(), old_path);
+        assert!(old_path.exists());
+        assert!(!new_path.exists());
+        assert!(zellij_utils::consts::ipc_connect(&old_path).is_ok());
     }
 
     #[cfg(unix)]
