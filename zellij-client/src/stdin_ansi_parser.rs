@@ -67,6 +67,8 @@ pub enum HostReply {
     KittyGraphicsSupport(bool),
     KittyZlibSupport(bool),
     SixelSupport(bool),
+    GraphemeClusterMode(u8),
+    ProgramStatusSupport,
 }
 
 /// Retained alias for the pre-refactor type name used by other modules in
@@ -89,6 +91,9 @@ impl HostReply {
             static ref COLOR_REGISTER_RE: Regex = Regex::new(r"^4;(\d+);(.*)$").unwrap();
         }
         let s = std::str::from_utf8(payload).ok()?;
+        if s == "7501;?" || s.starts_with("7501;?:") {
+            return Some(HostReply::ProgramStatusSupport);
+        }
         if let Some(caps) = BG_RE.captures(s) {
             return Some(HostReply::BackgroundColor(caps[1].to_string()));
         }
@@ -120,6 +125,11 @@ impl HostReply {
             // to CSI ?996n, or unsolicited host-theme notification when
             // CSI ?2031h is enabled.
             static ref THEME_RE: Regex = Regex::new(r"^\u{1b}\[\?997;([12])n$").unwrap();
+            static ref GRAPHEME_CLUSTER_RE: Regex = Regex::new(r"^\u{1b}\[\?2027;([0-4])\$y$").unwrap();
+        }
+        if let Some(caps) = GRAPHEME_CLUSTER_RE.captures(s) {
+            let value: u8 = caps[1].parse().ok()?;
+            return Some(HostReply::GraphemeClusterMode(value));
         }
         if let Some(caps) = PIX_RE.captures(s) {
             let which: usize = caps[1].parse().ok()?;
@@ -195,6 +205,7 @@ pub struct ForwardSlot {
 enum BatchOwner {
     Zellij,
     Pane(ForwardSlot),
+    ExitSentinel(std::sync::mpsc::Sender<()>),
 }
 
 #[derive(Debug, Clone)]
@@ -259,7 +270,10 @@ fn is_user_input(event: &InputEvent) -> bool {
 /// malformed sequence and flush the buffered bytes back to residue —
 /// same observable behaviour as today for unterminated OSC, just
 /// bounded.
+#[cfg(not(test))]
 const PARTIAL_BUFFER_CAP_BYTES: usize = 100 * 1024 * 1024;
+#[cfg(test)]
+const PARTIAL_BUFFER_CAP_BYTES: usize = 1024 * 1024;
 
 const PASTE_START_MARKER: &[u8] = b"\x1b[200~";
 const PASTE_END_MARKER: &[u8] = b"\x1b[201~";
@@ -338,7 +352,10 @@ pub struct StdinAnsiParser {
     in_bracketed_paste: bool,
     startup_kitty_probe: StartupKittyProbe,
     startup_kitty_zlib_probe: StartupKittyProbe,
+    startup_grapheme_cluster_probe: StartupKittyProbe,
     partial_apc: Vec<u8>,
+    primary_da_answered: bool,
+    exit_draining: bool,
 }
 
 impl std::fmt::Debug for StdinAnsiParser {
@@ -364,8 +381,15 @@ impl StdinAnsiParser {
             in_bracketed_paste: false,
             startup_kitty_probe: StartupKittyProbe::NotSent,
             startup_kitty_zlib_probe: StartupKittyProbe::NotSent,
+            startup_grapheme_cluster_probe: StartupKittyProbe::NotSent,
             partial_apc: Vec::new(),
+            primary_da_answered: false,
+            exit_draining: false,
         }
+    }
+
+    pub fn expect_grapheme_cluster_mode_reply(&mut self) {
+        self.startup_grapheme_cluster_probe = StartupKittyProbe::AwaitingReply;
     }
 
     pub fn expect_kitty_probe_reply(&mut self) {
@@ -420,6 +444,30 @@ impl StdinAnsiParser {
             owner: BatchOwner::Zellij,
             sent_at: Instant::now(),
         });
+    }
+
+    pub fn begin_exit_drain(
+        &mut self,
+        expect_sentinel_reply: bool,
+    ) -> Option<std::sync::mpsc::Receiver<()>> {
+        self.exit_draining = true;
+        if !expect_sentinel_reply {
+            return None;
+        }
+        let (answered, sentinel_reply) = std::sync::mpsc::channel();
+        self.batches.push_back(QueryBatch {
+            owner: BatchOwner::ExitSentinel(answered),
+            sent_at: Instant::now(),
+        });
+        Some(sentinel_reply)
+    }
+
+    pub fn is_exit_draining(&self) -> bool {
+        self.exit_draining
+    }
+
+    pub fn host_answers_queries(&self) -> bool {
+        self.primary_da_answered || self.awaiting_replies()
     }
 
     pub fn awaiting_replies(&self) -> bool {
@@ -592,16 +640,31 @@ impl StdinAnsiParser {
                             if let Some(reply) = HostReply::sixel_support_from_primary_da(&raw) {
                                 out.replies.push(reply);
                             }
+                            let closes_own_batch = !matches!(
+                                self.batches.front().map(|batch| &batch.owner),
+                                Some(BatchOwner::Pane(_))
+                            );
+                            if closes_own_batch
+                                && self.startup_grapheme_cluster_probe
+                                    == StartupKittyProbe::AwaitingReply
+                            {
+                                self.startup_grapheme_cluster_probe = StartupKittyProbe::Resolved;
+                                out.replies.push(HostReply::GraphemeClusterMode(0));
+                            }
                             // Primary-DA — the barrier. Close the slot and
                             // emit the completed forwarded reply if active.
-                            if let Some(QueryBatch {
-                                owner: BatchOwner::Pane(slot),
-                                ..
-                            }) = self.batches.pop_front()
-                            {
-                                if !slot.abandoned {
-                                    out.completed_forward = Some((slot.token, slot.reply_bytes));
-                                }
+                            self.primary_da_answered = true;
+                            match self.batches.pop_front().map(|batch| batch.owner) {
+                                Some(BatchOwner::Pane(slot)) => {
+                                    if !slot.abandoned {
+                                        out.completed_forward =
+                                            Some((slot.token, slot.reply_bytes));
+                                    }
+                                },
+                                Some(BatchOwner::ExitSentinel(answered)) => {
+                                    let _ = answered.send(());
+                                },
+                                _ => {},
                             }
                             // Primary-DA is NOT double-dispatched — it has
                             // no cached-state counterpart.
@@ -610,6 +673,18 @@ impl StdinAnsiParser {
                             let reply = HostReply::from_csi_report(&raw);
                             let is_theme_notification =
                                 matches!(reply, Some(HostReply::HostTerminalThemeChanged(_)));
+                            if let Some(HostReply::GraphemeClusterMode(value)) = reply {
+                                if let Some(slot) = self.collecting_forward_mut() {
+                                    slot.reply_bytes.extend_from_slice(&raw);
+                                } else if self.startup_grapheme_cluster_probe
+                                    == StartupKittyProbe::AwaitingReply
+                                {
+                                    self.startup_grapheme_cluster_probe =
+                                        StartupKittyProbe::Resolved;
+                                    out.replies.push(HostReply::GraphemeClusterMode(value));
+                                }
+                                continue;
+                            }
                             if let Some(reply) = reply {
                                 out.replies.push(reply);
                             }
