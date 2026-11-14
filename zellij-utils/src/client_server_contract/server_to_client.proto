@@ -24,11 +24,42 @@ message ServerToClientMsg {
     SetSoftKeyboardMsg set_soft_keyboard = 17;
     EmitNestedSessionFrameMsg emit_nested_session_frame = 18;
     MobileStateMsg mobile_state = 19;
+    RenderFrameMsg render_frame = 20;
+    HostThemeModeMsg host_theme_mode = 21;
+    TerminalSettingsMsg terminal_settings = 22;
+    HostProgramStatusMsg host_program_status = 23;
+    SessionAttentionMsg session_attention = 24;
+    SessionPreviewMsg session_preview = 25;
+    ServerPaneMirrorMsg pane_mirror = 26;
+    PasteFromClipboardMsg paste_from_clipboard = 27;
   }
+}
+
+message SessionPreviewMsg {
+  optional SessionPreview preview = 1;
+}
+
+message SessionAttentionMsg {
+  SessionAttention attention = 1;
+}
+
+message HostProgramStatusMsg {
+  optional HostProgramStatus status = 1;
+}
+
+message HostProgramStatus {
+  string state = 1;
+  optional string kind = 2;
+  optional uint32 progress = 3;
+  string msg = 4;
 }
 
 message RenderMsg {
   string content = 1;
+}
+
+message RenderFrameMsg {
+  bytes frame = 1;
 }
 
 message UnblockInputThreadMsg {
@@ -58,6 +89,7 @@ message SwitchSessionMsg {
 
 message UnblockCliPipeInputMsg {
   string pipe_name = 1;
+  optional int32 exit_code = 2;
 }
 
 message CliPipeOutputMsg {
@@ -81,6 +113,14 @@ message ConfigFileUpdatedMsg {
   // Empty message
 }
 
+message TerminalSettingsMsg {
+  string settings_json = 1;
+}
+
+message HostThemeModeMsg {
+  HostTerminalThemeIndication mode = 1;
+}
+
 message PaneRenderUpdateMsg {
   PaneId pane_id = 1;
   repeated string viewport = 2;
@@ -97,6 +137,10 @@ message ForwardQueryToHostMsg {
   uint32 token = 1;
   bytes query_bytes = 2;
   bool resolve_async = 3;
+}
+
+message PasteFromClipboardMsg {
+  optional PaneId pane_id = 1;
 }
 
 message SetSoftKeyboardMsg {
@@ -159,4 +203,8 @@ message MobileStateMsg {
   repeated MobilePaneMsg panes = 8;
   repeated MobileSessionMsg sessions = 9;
   MobileRenderPrefsMsg render_prefs = 10;
+}
+
+message ServerPaneMirrorMsg {
+  bytes payload = 1;
 }
