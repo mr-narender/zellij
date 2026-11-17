@@ -4042,7 +4042,7 @@ impl PreviewAnchor {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AppControlRequest {
-    #[prost(oneof="app_control_request::Request", tags="1, 2, 3, 4, 5, 6")]
+    #[prost(oneof="app_control_request::Request", tags="1, 2, 3, 4, 5, 6, 7")]
     pub request: ::core::option::Option<app_control_request::Request>,
 }
 /// Nested message and enum types in `AppControlRequest`.
@@ -4062,6 +4062,8 @@ pub mod app_control_request {
         Ping(super::AppPingRequest),
         #[prost(message, tag="6")]
         Describe(super::AppDescribeRequest),
+        #[prost(message, tag="7")]
+        QuitApp(super::AppQuitAppRequest),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -4106,6 +4108,24 @@ pub struct AppOpenWindowRequest {
     pub startup_mode: i32,
     #[prost(message, optional, tag="10")]
     pub layout: ::core::option::Option<LayoutInfo>,
+    #[prost(uint32, optional, tag="11")]
+    pub rows: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag="12")]
+    pub cols: ::core::option::Option<u32>,
+    #[prost(message, optional, tag="13")]
+    pub options: ::core::option::Option<Options>,
+    #[prost(string, optional, tag="14")]
+    pub token: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="15")]
+    pub remember: bool,
+    #[prost(bool, tag="16")]
+    pub forget: bool,
+    #[prost(string, optional, tag="17")]
+    pub ca_cert: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="18")]
+    pub insecure: bool,
+    #[prost(map="string, string", tag="19")]
+    pub env: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -4135,6 +4155,10 @@ pub struct AppDescribeRequest {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AppQuitAppRequest {
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AppDoneReply {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -4156,6 +4180,8 @@ pub struct AppStateReply {
     pub tray_icon: bool,
     #[prost(string, optional, tag="5")]
     pub focused_session: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="6")]
+    pub version: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
