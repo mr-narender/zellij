@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub const HOST_TERMINAL_ENV_VARS: [&str; 7] = [
+pub const HOST_TERMINAL_ENV_VARS: [&str; 9] = [
+    "SSH_CONNECTION",
+    "SSH_TTY",
     "TERM",
     "TERM_PROGRAM",
     "TERM_PROGRAM_VERSION",
@@ -22,6 +24,55 @@ pub const HOST_TERMINAL_ENV_VARS: [&str; 7] = [
 
 pub fn host_terminal_env() -> BTreeMap<String, String> {
     host_terminal_env_from(|name| std::env::var(name).ok())
+}
+
+pub const DESKTOP_TERMINAL_ENV_KEY: &str = "ZELLIJ_DESKTOP_TERMINAL";
+
+pub const DESKTOP_DISPLAY_ENV_KEY: &str = "ZELLIJ_DESKTOP_DISPLAY_ENV";
+
+pub const DESKTOP_DISPLAY_ENV_VARS: [&str; 4] = [
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XAUTHORITY",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+pub fn desktop_display_env(
+    host_terminal_env: &BTreeMap<String, String>,
+) -> Option<Vec<(&'static str, Option<String>)>> {
+    if !host_terminal_env.contains_key(DESKTOP_DISPLAY_ENV_KEY) {
+        return None;
+    }
+    Some(
+        DESKTOP_DISPLAY_ENV_VARS
+            .iter()
+            .map(|name| (*name, host_terminal_env.get(*name).cloned()))
+            .collect(),
+    )
+}
+
+pub fn client_location(
+    host_terminal_env: &BTreeMap<String, String>,
+    is_web_client: bool,
+) -> Option<String> {
+    if is_web_client {
+        return Some("through the web server".to_owned());
+    }
+    if host_terminal_env.contains_key(DESKTOP_TERMINAL_ENV_KEY) {
+        return None;
+    }
+    if let Some(connection) = host_terminal_env.get("SSH_CONNECTION") {
+        return Some(match connection.split_whitespace().next() {
+            Some(address) if !address.is_empty() => {
+                format!("from a terminal, over SSH from {}", address)
+            },
+            _ => "from a terminal, over SSH".to_owned(),
+        });
+    }
+    if host_terminal_env.contains_key("SSH_TTY") {
+        return Some("from a terminal, over SSH".to_owned());
+    }
+    Some("from a terminal".to_owned())
 }
 
 pub fn host_terminal_env_from<F: Fn(&str) -> Option<String>>(
@@ -48,11 +99,13 @@ pub struct CliAssets {
     pub cwd: Option<PathBuf>,
     pub host_terminal_env: BTreeMap<String, String>,
     pub initial_panes: Option<Vec<CommandOrPlugin>>,
+    #[serde(default)]
+    pub switch_context: Option<crate::session_history::SwitchContext>,
 }
 
 impl CliAssets {
     pub fn load_config_and_layout(&self) -> (Config, Layout) {
-        let config = {
+        let mut config = {
             if self.should_ignore_config {
                 Config::from_default_assets().unwrap_or_else(|_| Default::default())
             } else if let Some(ref path) = self.config_file_path {
@@ -64,6 +117,16 @@ impl CliAssets {
                 Config::from_default_assets().unwrap_or_else(|_| Default::default())
             }
         };
+        let config_dir = self.config_dir.clone().or_else(find_default_config_dir);
+        let keybinds_dir_override = self
+            .configuration_options
+            .as_ref()
+            .and_then(|options| options.keybinds_dir.clone());
+        if config.keybinds_layers.config_dir != config_dir || keybinds_dir_override.is_some() {
+            config.keybinds_layers.config_dir = config_dir;
+            config.keybinds_layers.keybinds_dir_override = keybinds_dir_override;
+            config.resolve_keybinds();
+        }
 
         let (mut layout, mut config_with_merged_layout_opts) = {
             let layout_dir = self
@@ -138,6 +201,81 @@ mod tests {
             .collect::<BTreeMap<String, String>>(),
             "unset and non-whitelisted variables are left out"
         );
+    }
+
+    #[test]
+    fn only_a_local_desktop_window_is_known_to_share_the_desktop() {
+        let window: BTreeMap<String, String> =
+            [(DESKTOP_TERMINAL_ENV_KEY.to_owned(), "1".to_owned())]
+                .into_iter()
+                .collect();
+        assert_eq!(client_location(&window, false), None);
+        assert_eq!(
+            client_location(&window, true).as_deref(),
+            Some("through the web server")
+        );
+        assert_eq!(
+            client_location(&BTreeMap::new(), false).as_deref(),
+            Some("from a terminal")
+        );
+        let over_ssh = host_terminal_env_from(|name| match name {
+            "SSH_CONNECTION" => Some("192.168.1.5 50022 192.168.1.2 22".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            client_location(&over_ssh, false).as_deref(),
+            Some("from a terminal, over SSH from 192.168.1.5")
+        );
+        let tty_only = host_terminal_env_from(|name| match name {
+            "SSH_TTY" => Some("/dev/pts/3".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            client_location(&tty_only, false).as_deref(),
+            Some("from a terminal, over SSH")
+        );
+        let spoofed = host_terminal_env_from(|name| match name {
+            DESKTOP_TERMINAL_ENV_KEY => Some("1".to_owned()),
+            _ => None,
+        });
+        assert_eq!(
+            client_location(&spoofed, false).as_deref(),
+            Some("from a terminal"),
+            "a terminal cannot pass itself off as a desktop window"
+        );
+    }
+
+    #[test]
+    fn only_a_window_that_vouches_for_its_display_env_has_it_adopted() {
+        let env = |entries: &[(&str, &str)]| -> BTreeMap<String, String> {
+            entries
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            desktop_display_env(&env(&[("WAYLAND_DISPLAY", "wayland-1")])),
+            None
+        );
+        assert_eq!(
+            desktop_display_env(&env(&[
+                (DESKTOP_DISPLAY_ENV_KEY, "1"),
+                ("WAYLAND_DISPLAY", "wayland-1"),
+                ("DISPLAY", ":1"),
+            ])),
+            Some(vec![
+                ("WAYLAND_DISPLAY", Some("wayland-1".to_owned())),
+                ("DISPLAY", Some(":1".to_owned())),
+                ("XAUTHORITY", None),
+                ("DBUS_SESSION_BUS_ADDRESS", None),
+            ]),
+            "a variable the window lacks is one the panes must not keep either"
+        );
+        let from_a_terminal = host_terminal_env_from(|name| match name {
+            DESKTOP_DISPLAY_ENV_KEY | "DISPLAY" => Some("1".to_owned()),
+            _ => None,
+        });
+        assert_eq!(desktop_display_env(&from_a_terminal), None);
     }
 
     #[test]

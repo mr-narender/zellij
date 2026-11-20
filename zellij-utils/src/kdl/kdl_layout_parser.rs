@@ -6,6 +6,7 @@ use crate::input::{
         RunPluginOrAlias, SplitDirection, SplitSize, SwapFloatingLayout, SwapTiledLayout,
         TiledPaneLayout,
     },
+    options::StackListOrientation,
 };
 
 use kdl::*;
@@ -93,6 +94,8 @@ impl<'a> KdlLayoutParser<'a> {
             || word == "border_bottom"
             || word == "border_left"
             || word == "rounded_corners"
+            || word == "attention_muted"
+            || word == "ignore_output"
     }
     fn is_a_valid_pane_property(&self, property_name: &str) -> bool {
         property_name == "borderless"
@@ -111,10 +114,13 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "children"
             || property_name == "stacked"
             || property_name == "expanded"
+            || property_name == "stack_orientation"
             || property_name == "exclude_from_sync"
             || property_name == "contents_file"
             || property_name == "default_fg"
             || property_name == "default_bg"
+            || property_name == "attention_muted"
+            || property_name == "ignore_output"
             || self.is_a_border_style_property(property_name)
     }
     fn is_a_border_style_property(&self, property_name: &str) -> bool {
@@ -173,6 +179,8 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "contents_file"
             || property_name == "default_fg"
             || property_name == "default_bg"
+            || property_name == "attention_muted"
+            || property_name == "ignore_output"
             || self.is_a_border_style_property(property_name)
     }
     fn is_a_valid_tab_property(&self, property_name: &str) -> bool {
@@ -186,6 +194,7 @@ impl<'a> KdlLayoutParser<'a> {
             || property_name == "min_panes"
             || property_name == "exact_panes"
             || property_name == "hide_floating_panes"
+            || property_name == "attention_muted"
     }
     pub fn is_a_reserved_plugin_property(property_name: &str) -> bool {
         property_name == "location"
@@ -566,6 +575,24 @@ impl<'a> KdlLayoutParser<'a> {
         }
         Ok(run)
     }
+    fn parse_stack_orientation(
+        &self,
+        kdl_node: &KdlNode,
+    ) -> Result<Option<StackListOrientation>, ConfigError> {
+        match kdl_get_string_property_or_child_value_with_error!(kdl_node, "stack_orientation") {
+            None => Ok(None),
+            Some("vertical") => Ok(Some(StackListOrientation::Vertical)),
+            Some("horizontal") => Ok(Some(StackListOrientation::Horizontal)),
+            Some(other) => Err(ConfigError::new_layout_kdl_error(
+                format!(
+                    "Invalid stack_orientation: '{}' (expected \"vertical\" or \"horizontal\")",
+                    other
+                ),
+                kdl_node.span().offset(),
+                kdl_node.span().len(),
+            )),
+        }
+    }
     fn parse_pane_node(
         &self,
         kdl_node: &KdlNode,
@@ -574,6 +601,7 @@ impl<'a> KdlLayoutParser<'a> {
         self.assert_valid_pane_properties(kdl_node)?;
         let children_are_stacked =
             kdl_get_bool_property_or_child_value_with_error!(kdl_node, "stacked").unwrap_or(false);
+        let stack_orientation = self.parse_stack_orientation(kdl_node)?;
         let is_expanded_in_stack =
             kdl_get_bool_property_or_child_value_with_error!(kdl_node, "expanded").unwrap_or(false);
         let borderless = kdl_get_bool_property_or_child_value_with_error!(kdl_node, "borderless");
@@ -606,6 +634,12 @@ impl<'a> KdlLayoutParser<'a> {
                 kdl_node.span().offset(),
                 kdl_node.span().len(),
             ));
+        } else if stack_orientation.is_some() && !children_are_stacked {
+            return Err(ConfigError::new_layout_kdl_error(
+                format!("stack_orientation can only be set on a stacked pane"),
+                kdl_node.span().offset(),
+                kdl_node.span().len(),
+            ));
         } else if is_expanded_in_stack && !is_part_of_stack {
             return Err(ConfigError::new_layout_kdl_error(
                 format!("An expanded pane must be part of a stack"),
@@ -627,9 +661,15 @@ impl<'a> KdlLayoutParser<'a> {
                 })
         });
         let border_style = self.parse_border_style(kdl_node)?;
+        let attention_muted =
+            kdl_get_bool_property_or_child_value_with_error!(kdl_node, "attention_muted");
+        let ignore_output =
+            kdl_get_bool_property_or_child_value_with_error!(kdl_node, "ignore_output");
         Ok(TiledPaneLayout {
             borderless,
             border_style,
+            attention_muted,
+            ignore_output,
             focus,
             name,
             split_size,
@@ -640,6 +680,7 @@ impl<'a> KdlLayoutParser<'a> {
             children,
             children_are_stacked,
             is_expanded_in_stack,
+            stack_orientation,
             pane_initial_contents,
             default_fg,
             default_bg,
@@ -677,8 +718,14 @@ impl<'a> KdlLayoutParser<'a> {
                 })
         });
         let border_style = self.parse_border_style(kdl_node)?;
+        let attention_muted =
+            kdl_get_bool_property_or_child_value_with_error!(kdl_node, "attention_muted");
+        let ignore_output =
+            kdl_get_bool_property_or_child_value_with_error!(kdl_node, "ignore_output");
         Ok(FloatingPaneLayout {
             name,
+            attention_muted,
+            ignore_output,
             height,
             width,
             x,
@@ -703,6 +750,16 @@ impl<'a> KdlLayoutParser<'a> {
         let children_are_stacked =
             kdl_get_bool_property_or_child_value_with_error!(kdl_node, "stacked")
                 .unwrap_or(pane_template.children_are_stacked);
+        let stack_orientation = self
+            .parse_stack_orientation(kdl_node)?
+            .or(pane_template.stack_orientation);
+        if stack_orientation.is_some() && !children_are_stacked {
+            return Err(ConfigError::new_layout_kdl_error(
+                "stack_orientation can only be set on a stacked pane".into(),
+                kdl_node.span().offset(),
+                kdl_node.span().len(),
+            ));
+        }
         let is_expanded_in_stack =
             kdl_get_bool_property_or_child_value_with_error!(kdl_node, "expanded")
                 .unwrap_or(pane_template.children_are_stacked);
@@ -720,6 +777,7 @@ impl<'a> KdlLayoutParser<'a> {
                 external_children_index,
                 children_are_stacked,
                 is_expanded_in_stack,
+                stack_orientation,
                 ..Default::default()
             };
             self.assert_one_children_block(&pane_template, pane_template_kdl_node)?;
@@ -776,6 +834,7 @@ impl<'a> KdlLayoutParser<'a> {
                     .map(|name| name.to_string());
                 let children_are_stacked =
                     kdl_get_bool_property_or_child_value_with_error!(kdl_node, "stacked");
+                let stack_orientation = self.parse_stack_orientation(kdl_node)?;
                 let is_expanded_in_stack =
                     kdl_get_bool_property_or_child_value_with_error!(kdl_node, "expanded");
                 let args = self.parse_args(kdl_node)?;
@@ -848,6 +907,9 @@ impl<'a> KdlLayoutParser<'a> {
                 }
                 if let Some(children_are_stacked) = children_are_stacked {
                     pane_template.children_are_stacked = children_are_stacked;
+                }
+                if let Some(stack_orientation) = stack_orientation {
+                    pane_template.stack_orientation = Some(stack_orientation);
                 }
                 if let Some(is_expanded_in_stack) = is_expanded_in_stack {
                     pane_template.is_expanded_in_stack = is_expanded_in_stack;
@@ -1207,13 +1269,20 @@ impl<'a> KdlLayoutParser<'a> {
             );
         } else {
             self.assert_valid_pane_properties(kdl_node)?;
-            // pane properties
+            let stack_orientation = self.parse_stack_orientation(kdl_node)?;
             let borderless =
                 kdl_get_bool_property_or_child_value_with_error!(kdl_node, "borderless");
             let border_style = self.parse_border_style(kdl_node)?;
             let children_are_stacked =
                 kdl_get_bool_property_or_child_value_with_error!(kdl_node, "stacked")
                     .unwrap_or(false);
+            if stack_orientation.is_some() && !children_are_stacked {
+                return Err(ConfigError::new_layout_kdl_error(
+                    "stack_orientation can only be set on a stacked pane".into(),
+                    kdl_node.span().offset(),
+                    kdl_node.span().len(),
+                ));
+            }
             let is_expanded_in_stack =
                 kdl_get_bool_property_or_child_value_with_error!(kdl_node, "expanded")
                     .unwrap_or(false);
@@ -1240,6 +1309,7 @@ impl<'a> KdlLayoutParser<'a> {
                         children: pane_parts,
                         children_are_stacked,
                         is_expanded_in_stack,
+                        stack_orientation,
                         ..Default::default()
                     }),
                     kdl_node.clone(),
@@ -1269,6 +1339,8 @@ impl<'a> KdlLayoutParser<'a> {
         let is_focused = kdl_get_bool_property_or_child_value!(kdl_node, "focus").unwrap_or(false);
         let hide_floating_panes =
             kdl_get_bool_property_or_child_value!(kdl_node, "hide_floating_panes").unwrap_or(false);
+        let tab_attention_muted =
+            kdl_get_bool_property_or_child_value!(kdl_node, "attention_muted");
         let children_split_direction = self.parse_split_direction(kdl_node)?;
         let mut child_floating_panes = vec![];
         let children = match kdl_children_nodes!(kdl_node) {
@@ -1286,6 +1358,7 @@ impl<'a> KdlLayoutParser<'a> {
             children_split_direction,
             children,
             hide_floating_panes,
+            attention_muted: tab_attention_muted,
             ..Default::default()
         };
         if let Some(cwd_prefix) = &self.cwd_prefix(tab_cwd.as_ref())? {
@@ -2575,7 +2648,7 @@ impl<'a> KdlLayoutParser<'a> {
                 )?;
             }
         }
-        if !child_tabs.is_empty() {
+        let mut layout = if !child_tabs.is_empty() {
             // Check if layout_node has tab properties when there are explicit tabs
             let layout_has_tab_name =
                 kdl_get_string_property_or_child_value!(layout_node, "name").is_some();
@@ -2676,6 +2749,10 @@ impl<'a> KdlLayoutParser<'a> {
                 hide_floating_panes,
                 tab_cwd,
             )
-        }
+        }?;
+        layout.session_attention_muted =
+            kdl_get_bool_property_or_child_value!(layout_node, "session_attention_muted")
+                .unwrap_or(false);
+        Ok(layout)
     }
 }
