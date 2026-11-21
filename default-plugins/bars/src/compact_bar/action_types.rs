@@ -33,8 +33,12 @@ pub enum ActionType {
     EditScrollback,
     NewTab,
     Detach,
+    Inbox,
     Quit,
     NewStackedPane,
+    ToggleStackListOrientation,
+    ToggleBars,
+    ShowBars,
     Other(String),
 }
 
@@ -57,13 +61,16 @@ impl ActionType {
             ActionType::HalfPageScroll => "Scroll half Page".to_string(),
             ActionType::SessionManager => "Session manager".to_string(),
             ActionType::PluginManager => "Plugin manager".to_string(),
-            ActionType::Configuration => "Configuration".to_string(),
+            ActionType::Configuration => "Settings".to_string(),
             ActionType::About => "About Zellij".to_string(),
             ActionType::SwitchToMode(input_mode) if input_mode == &InputMode::RenamePane => {
                 "Rename pane".to_string()
             },
             ActionType::SwitchToMode(input_mode) if input_mode == &InputMode::RenameTab => {
                 "Rename tab".to_string()
+            },
+            ActionType::SwitchToMode(input_mode) if input_mode == &InputMode::RenameSession => {
+                "Rename session".to_string()
             },
             ActionType::SwitchToMode(input_mode) if input_mode == &InputMode::EnterSearch => {
                 "Search".to_string()
@@ -87,7 +94,13 @@ impl ActionType {
             ActionType::EditScrollback => "Open pane scrollback in editor".to_string(),
             ActionType::NewTab => "New tab".to_string(),
             ActionType::Detach => "Detach".to_string(),
+            ActionType::Inbox => "Inbox".to_string(),
             ActionType::Quit => "Quit".to_string(),
+            ActionType::ToggleStackListOrientation => {
+                "Show stack titles in a row/column".to_string()
+            },
+            ActionType::ToggleBars => "Show/hide bars".to_string(),
+            ActionType::ShowBars => "Show bars".to_string(),
             ActionType::Other(_) => "Other action".to_string(),
         }
     }
@@ -133,7 +146,11 @@ impl ActionType {
             Action::BreakPane => ActionType::BreakPane,
             Action::EditScrollback { .. } => ActionType::EditScrollback,
             Action::Detach => ActionType::Detach,
+            Action::ToggleSessionCard => ActionType::Inbox,
             Action::Quit => ActionType::Quit,
+            Action::ToggleStackListOrientation => ActionType::ToggleStackListOrientation,
+            Action::ToggleBars { .. } => ActionType::ToggleBars,
+            Action::ShowBars => ActionType::ShowBars,
             action if action.launches_plugin("session-manager") => ActionType::SessionManager,
             action if action.launches_plugin("configuration") => ActionType::Configuration,
             action if action.launches_plugin("plugin-manager") => ActionType::PluginManager,
