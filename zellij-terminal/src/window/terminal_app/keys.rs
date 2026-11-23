@@ -10,17 +10,20 @@ use crate::window::ZOOM_STEP;
 use winit::event::Ime;
 use winit::event::KeyEvent;
 use winit::keyboard::Key;
+use zellij_utils::input::actions::Action;
+use zellij_utils::ipc::ClientToServerMsg;
 
 use std::path::Path;
 
 impl App {
     pub(in crate::window) fn on_key(&mut self, event: &KeyEvent) {
-        let option_as_alt = keyboard::option_acts_as_alt(
+        let keeps_alt = keyboard::keeps_alt(
             Platform::current(),
             self.options.option_as_alt,
             self.alt_keys,
+            self.modifiers,
         );
-        self.press(keyboard::Press::of(event, self.modifiers, option_as_alt));
+        self.press(keyboard::Press::of(event, self.modifiers, keeps_alt));
     }
 
     pub(in crate::window) fn press(&mut self, press: keyboard::Press) {
@@ -91,9 +94,12 @@ impl App {
             self.toggle_fullscreen();
             return;
         }
-        if keyboard::claims(&self.options.copy_keys, &press) && self.copy_selection() {
+        if keyboard::claims(&self.options.copy_keys, &press) {
             self.hide_pointer();
             self.stop_momentum();
+            if !self.copy_selection() {
+                self.copy_session_selection();
+            }
             return;
         }
         if keyboard::claims(&self.options.paste_keys, &press) {
@@ -103,6 +109,18 @@ impl App {
             return;
         }
         self.deliver(&press);
+    }
+
+    fn copy_session_selection(&mut self) {
+        let msg = ClientToServerMsg::Action {
+            action: Action::Copy,
+            terminal_id: None,
+            client_id: None,
+            is_cli_client: false,
+        };
+        if let Err(e) = self.tell(msg) {
+            report!("failed to ask the session to copy: {}", e);
+        }
     }
 
     pub(in crate::window) fn deliver(&mut self, press: &keyboard::Press) {
