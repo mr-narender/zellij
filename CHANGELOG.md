@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+
+## [0.46.1] - 2026-11-24
 * fix: "Show inbox" opens the inbox even when it's empty (https://github.com/zellij-org/zellij/pull/5869)
 * fix: broken links to the inbox integrations and plugin workers docs (https://github.com/zellij-org/zellij/pull/5877)
 * fix: terminal settings occasionally not properly applied or bounce back from the settings interface (https://github.com/zellij-org/zellij/pull/5887)
@@ -38,6 +40,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 * fix(windows): Ctrl+Alt shortcuts in `zellij terminal` on keys where AltGr types nothing, such as Ctrl+Alt+L (https://github.com/zellij-org/zellij/pull/5970)
 * fix: get the desktop copy key to also work for server text selection (https://github.com/zellij-org/zellij/pull/5975)
 * fix(terminal): Alt dropped from Alt+AltGr chords on Linux (Alt+] on German Dvorak) and from Alt+Shift on symbol keys (Alt++) (https://github.com/zellij-org/zellij/pull/5972)
+* feat: New Window in the Dock menu of the desktop app on macOS (https://github.com/zellij-org/zellij/pull/5982)
 
 ## [0.46.0] - 2026-11-11
 * (BREAKING CHANGE zellij-tile) `NestedListItem::new` now require a `Text` instead of a `&str` (https://github.com/zellij-org/zellij/pull/5611)
