@@ -1,4 +1,4 @@
-use crate::os_input_output::{command_exists, AsyncReader};
+use crate::os_input_output::{command_exists, AsyncReader, PaneEnv};
 use crate::panes::PaneId;
 
 use nix::{
@@ -81,23 +81,38 @@ impl RawFdAsyncReader {
     }
 }
 
+fn read_available(fd: RawFd, max: usize) -> Result<Vec<u8>, io::Error> {
+    let mut buf: Vec<u8> = Vec::with_capacity(max);
+    let ret = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.capacity()) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { buf.set_len(ret as usize) };
+    while ret > 0 && buf.len() < buf.capacity() {
+        let filled = buf.len();
+        let more = unsafe {
+            libc::read(
+                fd,
+                buf.as_mut_ptr().add(filled) as *mut libc::c_void,
+                buf.capacity() - filled,
+            )
+        };
+        if more <= 0 {
+            break;
+        }
+        unsafe { buf.set_len(filled + more as usize) };
+    }
+    buf.shrink_to_fit();
+    Ok(buf)
+}
+
 #[async_trait]
 impl AsyncReader for RawFdAsyncReader {
     async fn read_chunk(&mut self, max: usize) -> Result<Vec<u8>, io::Error> {
         let async_fd = self.get_async_fd()?;
         loop {
             let mut guard = async_fd.readable().await?;
-            match guard.try_io(|inner| {
-                let mut buf = vec![0u8; max];
-                let fd = inner.get_ref().as_raw_fd();
-                let ret =
-                    unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-                if ret < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(buf[..ret as usize].to_vec())
-                }
-            }) {
+            match guard.try_io(|inner| read_available(inner.get_ref().as_raw_fd(), max)) {
                 Ok(result) => return result,
                 Err(_would_block) => continue,
             }
@@ -189,6 +204,7 @@ fn handle_openpty(
     cmd: RunCommand,
     quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
     terminal_id: u32,
+    pane_env: &PaneEnv,
 ) -> Result<(RawFd, RawFd)> {
     let err_context = |cmd: &RunCommand| {
         format!(
@@ -201,7 +217,7 @@ fn handle_openpty(
     let pid_primary = open_pty_res.master.into_raw_fd();
     let pid_secondary = open_pty_res.slave.into_raw_fd();
 
-    if !command_exists(&cmd) {
+    if !command_exists(&cmd, pane_env) {
         return Err(ZellijError::CommandNotFound {
             terminal_id,
             command: cmd.command.to_string_lossy().to_string(),
@@ -221,6 +237,12 @@ fn handle_openpty(
                     current_dir.display()
                 );
             }
+        }
+        for (name, value) in pane_env {
+            match value {
+                Some(value) => command.env(name, value),
+                None => command.env_remove(name),
+            };
         }
         command
             .args(&cmd.args)
@@ -257,18 +279,24 @@ fn handle_terminal(
     orig_termios: Option<termios::Termios>,
     quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
     terminal_id: u32,
+    pane_env: &PaneEnv,
 ) -> Result<(RawFd, RawFd)> {
     let err_context = || "failed to spawn child terminal".to_string();
 
     // Create a pipe to allow the child the communicate the shell's pid to its
     // parent.
     match openpty(None, &orig_termios) {
-        Ok(open_pty_res) => handle_openpty(open_pty_res, cmd, quit_cb, terminal_id),
+        Ok(open_pty_res) => handle_openpty(open_pty_res, cmd, quit_cb, terminal_id, pane_env),
         Err(e) => match failover_cmd {
-            Some(failover_cmd) => {
-                handle_terminal(failover_cmd, None, orig_termios, quit_cb, terminal_id)
-                    .with_context(err_context)
-            },
+            Some(failover_cmd) => handle_terminal(
+                failover_cmd,
+                None,
+                orig_termios,
+                quit_cb,
+                terminal_id,
+                pane_env,
+            )
+            .with_context(err_context),
             None => Err::<(i32, i32), _>(e)
                 .context("failed to start pty")
                 .with_context(err_context)
@@ -324,6 +352,7 @@ impl UnixPtyBackend {
         failover_cmd: Option<RunCommand>,
         quit_cb: Box<dyn Fn(PaneId, Option<i32>, RunCommand) + Send>,
         terminal_id: u32,
+        pane_env: &PaneEnv,
     ) -> Result<(Box<dyn AsyncReader>, RawFd)> {
         let orig_termios = self
             .orig_termios
@@ -336,6 +365,7 @@ impl UnixPtyBackend {
             orig_termios.clone(),
             quit_cb,
             terminal_id,
+            pane_env,
         )?;
         self.terminal_id_to_raw_fd
             .lock()

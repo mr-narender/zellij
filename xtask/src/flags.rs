@@ -104,6 +104,8 @@ xflags::xflags! {
         cmd test {
             /// Compile without web server support
             optional --no-web
+            /// Compile without the Zellij terminal
+            optional --no-terminal
             /// Arguments to pass after `cargo test --`
             repeated args: OsString
         }
@@ -248,6 +250,7 @@ pub struct Test {
     pub args: Vec<OsString>,
 
     pub no_web: bool,
+    pub no_terminal: bool,
 }
 
 #[derive(Debug)]

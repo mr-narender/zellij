@@ -1,10 +1,9 @@
 use crate::file_list_view::FsEntry;
 use crate::platform::Platform;
+use crate::shared::format_file_size;
 use crate::shared::{calculate_list_bounds, render_list_tip};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use pretty_bytes::converter::convert as pretty_bytes;
-use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
 
 #[derive(Default, Debug)]
@@ -65,14 +64,15 @@ impl SearchView {
                 let mut search_result_text = search_result.name();
                 let size = search_result
                     .size()
-                    .map(|s| pretty_bytes(s as f64))
+                    .map(format_file_size)
                     .unwrap_or("".to_owned());
                 if search_result.is_folder() {
                     search_result_text.push(self.platform.separator());
                 }
 
-                let search_result_text_width = search_result_text.width();
-                let size_width = size.width();
+                let search_result_text_width =
+                    zellij_tile::graphemes::display_width(&search_result_text);
+                let size_width = zellij_tile::graphemes::display_width(&size);
                 let text = if search_result_text_width + size_width < cols {
                     let padding = " ".repeat(
                         cols.saturating_sub(search_result_text_width)
@@ -85,9 +85,9 @@ impl SearchView {
                     format!("{}{}", search_result_text, padding)
                 };
                 let mut text_element = if is_selected {
-                    Text::new(text).selected()
+                    Text::from(text).selected()
                 } else {
-                    Text::new(text)
+                    Text::from(text)
                 };
                 if search_result.is_folder() {
                     text_element = text_element.color_range(0, ..);

@@ -227,6 +227,11 @@ impl<'a> PluginLoader<'a> {
         }
 
         let subscriptions = store.data().subscriptions.clone();
+        let in_blocking_call = store
+            .data()
+            .shared
+            .as_ref()
+            .map(|shared| shared.in_blocking_call.clone());
         let plugin = Arc::new(Mutex::new(RunningPlugin::new(
             store,
             main_user_instance,
@@ -234,8 +239,11 @@ impl<'a> PluginLoader<'a> {
             self.size.cols,
         )));
         if shared {
-            self.plugin_map
-                .insert_shared(self.plugin_id, (plugin.clone(), subscriptions, workers));
+            self.plugin_map.insert_shared(
+                self.plugin_id,
+                (plugin.clone(), subscriptions, workers),
+                in_blocking_call,
+            );
         } else {
             self.plugin_map.insert(
                 self.plugin_id,
@@ -309,6 +317,7 @@ impl<'a> PluginLoader<'a> {
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             keybinds: self.keybinds.clone(),
             intercepting_key_presses: false,
+            pending_popup_size: None,
             stdin_pipe,
             stdout_pipe,
             store_limits: create_optimized_store_limits(),
@@ -421,6 +430,7 @@ impl<'a> PluginLoader<'a> {
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             keybinds: self.keybinds.clone(),
             intercepting_key_presses: false,
+            pending_popup_size: None,
             stdin_pipe,
             stdout_pipe,
             store_limits: create_optimized_store_limits(),
@@ -469,7 +479,7 @@ impl<'a> PluginLoader<'a> {
         let dirs = dirs.into_iter().filter(|(_dir_name, dir)| {
             // note that this does not protect against TOCTOU errors
             // eg. if one or more of these folders existed at the time of check but was deleted
-            // before we mounted in in the wasi environment, we'll crash
+            // before we mounted in the wasi environment, we'll crash
             // when we move to a new wasi environment, we should address this with locking if
             // there's no built-in solution
             dir.try_exists().ok().unwrap_or(false)
