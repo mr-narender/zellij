@@ -27,7 +27,9 @@ fn prompt_count(grid_snapshot: &GridSnapshot) -> usize {
 }
 
 fn session_mode_bar_settled(grid_snapshot: &GridSnapshot) -> bool {
-    last_line_contains(grid_snapshot, "SESSION") && last_line_contains(grid_snapshot, "Detach")
+    last_line_contains(grid_snapshot, "SESSION")
+        && (last_line_contains(grid_snapshot, "Next")
+            || last_line_contains(grid_snapshot, "next item"))
 }
 
 fn last_line_contains(grid_snapshot: &GridSnapshot, needle: &str) -> bool {
@@ -367,6 +369,7 @@ fn focus_host_session_binding_returns_control_to_host() {
                 && host_grid.contains("Pane #2")
                 && prompt_count(host_grid) == 1
                 && host_own_tab_bar_settled(host_grid, &guest_session_name)
+                && host_grid.cursor_is_at(col(0).row(3))
         },
     );
     assert_snapshot!(
@@ -1032,8 +1035,8 @@ fn host_chrome_restores_exactly_after_ascend() {
         "host chrome rows restore exactly after ascend"
     );
 
-    nested.guest.quit();
-    nested.host.quit();
+    nested.guest.kill_session();
+    nested.host.kill_session();
 }
 
 #[test]

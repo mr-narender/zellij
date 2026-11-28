@@ -1,10 +1,9 @@
 use crate::platform::Platform;
+use crate::shared::format_file_size;
 use crate::shared::{calculate_list_bounds, render_list_tip};
 use crate::state::refresh_directory;
-use pretty_bytes::converter::convert as pretty_bytes;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use unicode_width::UnicodeWidthStr;
 use zellij_tile::prelude::*;
 
 #[derive(Debug, Clone)]
@@ -128,15 +127,13 @@ impl FileListView {
             if let Some(entry) = self.files.get(i) {
                 let is_selected = Some(i) == selected_index_in_range;
                 let mut file_or_folder_name = entry.name();
-                let size = entry
-                    .size()
-                    .map(|s| pretty_bytes(s as f64))
-                    .unwrap_or("".to_owned());
+                let size = entry.size().map(format_file_size).unwrap_or("".to_owned());
                 if entry.is_folder() {
                     file_or_folder_name.push(self.platform.separator());
                 }
-                let file_or_folder_name_width = file_or_folder_name.width();
-                let size_width = size.width();
+                let file_or_folder_name_width =
+                    zellij_tile::graphemes::display_width(&file_or_folder_name);
+                let size_width = zellij_tile::graphemes::display_width(&size);
                 let text = if file_or_folder_name_width + size_width < cols {
                     let padding = " ".repeat(
                         cols.saturating_sub(file_or_folder_name_width)
@@ -148,9 +145,9 @@ impl FileListView {
                     format!("{}{}", file_or_folder_name, padding)
                 };
                 let mut text_element = if is_selected {
-                    Text::new(text).selected()
+                    Text::from(text).selected()
                 } else {
-                    Text::new(text)
+                    Text::from(text)
                 };
                 if entry.is_folder() {
                     text_element = text_element.color_range(0, ..);
